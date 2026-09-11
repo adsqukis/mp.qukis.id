@@ -648,6 +648,20 @@ def _ads_campaign_perf_batch(campaign_ids, from_iso, to_iso):
             out[c.get('campaign_id')] = c.get('metrics_list') or []
         return True
 
+    # batch gagal → coba setengah-setengah (rekursif) utk isolasi id jelek.
+    # Didefinisikan sekali di luar loop (sebelumnya re-defined tiap iterasi).
+    def split_fetch(lst):
+        if len(lst) == 1:
+            if fetch_batch(lst) is None:
+                bad.append(lst[0])
+            return
+        mid = len(lst) // 2
+        a, b = lst[:mid], lst[mid:]
+        if fetch_batch(a) is None:
+            split_fetch(a)
+        if fetch_batch(b) is None:
+            split_fetch(b)
+
     for i in range(0, len(campaign_ids), 100):
         batch = campaign_ids[i:i + 100]
         if len(batch) <= 1:
@@ -656,41 +670,16 @@ def _ads_campaign_perf_batch(campaign_ids, from_iso, to_iso):
             continue
         if fetch_batch(batch) is not None:
             continue
-        # batch gagal → coba setengah-setengah (rekursif) utk isolasi id jelek
-        def split_fetch(lst):
-            if len(lst) == 1:
-                if fetch_batch(lst) is None:
-                    bad.append(lst[0])
-                return
-            mid = len(lst) // 2
-            a, b = lst[:mid], lst[mid:]
-            if fetch_batch(a) is None:
-                split_fetch(a)
-            if fetch_batch(b) is None:
-                split_fetch(b)
         split_fetch(batch)
     return out
 
-def _agg_metrics(perf_map, campaign_ids):
-    exp = klik = imp = closing = gmv = 0.0
-    for cid in campaign_ids:
-        for m in perf_map.get(cid, []):
-            exp += float(m.get('expense') or 0)
-            klik += int(m.get('clicks') or 0)
-            imp += int(m.get('impression') or 0)
-            closing += int(m.get('broad_order') or 0)
-            gmv += float(m.get('broad_gmv') or 0)
-    return {
-        'budget': round(exp),
-        'klik': int(klik),
-        'closing': int(closing),
-        'gmv': round(gmv),
-        'roas': round(gmv / exp, 2) if exp > 0 else None,
-        'impression': int(imp),
-    }
-
 def _ads_detail_builder(from_iso, to_iso):
-    """Data lengkap Tab Ads: total shop-level + agregasi per kategori placement."""
+    """Data lengkap Tab Ads: total shop-level + agregasi per kategori placement.
+
+    Catatan: endpoint ini (/api/ads/detail) TIDAK dipanggil frontend saat ini
+    (Tab Ads pakai /api/ads/metric + /api/ads/series, arsitektur card-based).
+    Dibiarkan aktif kalau ada konsumen lain (laporan terpisah, dsb) — kalau
+    memang gak dipakai, aman dihapus bareng ads_detail() & handler di do_GET."""
     daily = _ads_daily_performance_range(from_iso, to_iso)
     cams = _ads_campaign_list()
     ids = [c.get('campaign_id') for c in cams if c.get('campaign_id')]
@@ -797,80 +786,6 @@ _ADS_CARDS = {
     },
 }
 
-# Komponen split per tanggal: total (get_all) | product (campaign product) | shop (selisih).
-def _ads_split_series(from_iso, to_iso):
-    daily = _ads_daily_performance_range(from_iso, to_iso)
-    cams = _ads_campaign_list()
-    ids = [c.get('campaign_id') for c in cams if c.get('campaign_id')]
-    perf = _ads_campaign_perf_batch(ids, from_iso, to_iso) if ids else {}
-    prod_by_date = {}
-    for ml in perf.values():
-        for m in ml:
-            key = m.get('date')
-            a = prod_by_date.setdefault(key, {'imp': 0, 'clk': 0, 'ord': 0, 'gmv': 0.0, 'exp': 0.0})
-            a['imp'] += int(m.get('impression') or 0)
-            a['clk'] += int(m.get('clicks') or 0)
-            a['ord'] += int(m.get('broad_order') or 0)
-            a['gmv'] += float(m.get('broad_gmv') or 0)
-            a['exp'] += float(m.get('expense') or 0)
-    out = []
-    for d in daily:
-        key = d.get('date')
-        p = prod_by_date.get(key, {'imp': 0, 'clk': 0, 'ord': 0, 'gmv': 0.0, 'exp': 0.0})
-        tot = {
-            'imp': int(d.get('impression') or 0), 'clk': int(d.get('clicks') or 0),
-            'ord': int(d.get('broad_order') or 0), 'sold': int(d.get('broad_item_sold') or 0),
-            'gmv': float(d.get('broad_gmv') or 0), 'exp': float(d.get('expense') or 0),
-        }
-        # item_sold TIDAK tersedia per-campaign → sold per komponen = None (jangan dikarang)
-        out.append({
-            'date': key,
-            'total': tot,
-            'product': {'imp': p['imp'], 'clk': p['clk'], 'ord': p['ord'], 'sold': None,
-                        'gmv': p['gmv'], 'exp': p['exp']},
-            'shop': {'imp': max(0, tot['imp'] - p['imp']), 'clk': max(0, tot['clk'] - p['clk']),
-                     'ord': max(0, tot['ord'] - p['ord']), 'sold': None,
-                     'gmv': max(0.0, tot['gmv'] - p['gmv']), 'exp': max(0.0, tot['exp'] - p['exp'])},
-        })
-    return out
-
-def _ads_split_cached(from_iso, to_iso):
-    key = f'adss_{from_iso}_{to_iso}'
-    return _orders_get('ads_split', key, lambda: _ads_split_series(from_iso, to_iso), ttl=ADS_METRIC_TTL)
-
-def _agg_comp(rows, comp):
-    a = {'imp': 0, 'clk': 0, 'ord': 0, 'sold': None, 'gmv': 0.0, 'exp': 0.0}
-    if not rows:
-        return a
-    a['imp'] = sum(r[comp]['imp'] for r in rows)
-    a['clk'] = sum(r[comp]['clk'] for r in rows)
-    a['ord'] = sum(r[comp]['ord'] for r in rows)
-    a['gmv'] = sum(r[comp]['gmv'] for r in rows)
-    a['exp'] = sum(r[comp]['exp'] for r in rows)
-    solds = [r[comp]['sold'] for r in rows if r[comp]['sold'] is not None]
-    a['sold'] = sum(solds) if solds else None
-    return a
-
-def _comp_metric_value(agg, metric):
-    imp, clk, ord_, sold, gmv, exp = agg['imp'], agg['clk'], agg['ord'], agg['sold'], agg['gmv'], agg['exp']
-    if metric == 'impressions':
-        return imp
-    if metric == 'clicks':
-        return clk
-    if metric == 'orders':
-        return ord_
-    if metric == 'sold':
-        return sold  # None kalau tidak tersedia per komponen
-    if metric == 'sales':
-        return int(round(gmv))
-    if metric == 'ad_spend':
-        return int(round(exp))
-    if metric == 'ctr':
-        return round((clk / imp * 100.0) if imp else 0.0, 2)
-    if metric == 'roas':
-        return round((gmv / exp) if exp else 0.0, 2)
-    return None
-
 def _fmt_metric_value(value, kind):
     if kind == 'money':
         return "Rp" + f"{int(round(value)):,}".replace(',', '.')
@@ -886,29 +801,22 @@ def _fmt_metric_value(value, kind):
         return f"{(v / 1_000):.1f}".replace('.', ',') + "rb"
     return f"{v:,}".replace(',', '.')
 
+def _sum_daily(daily_list):
+    """Jumlahkan list harian (get_all_cpc_ads_daily_performance) jadi satu item
+    agregat berbentuk sama seperti 1 baris Shopee — biar bisa dipakai ulang oleh
+    _series_metric_value (rumus ctr/roas/dst jadi satu-satunya sumber, gak ke-copy)."""
+    return {
+        'impression': sum(int(d.get('impression') or 0) for d in daily_list),
+        'clicks': sum(int(d.get('clicks') or 0) for d in daily_list),
+        'broad_order': sum(int(d.get('broad_order') or 0) for d in daily_list),
+        'broad_item_sold': sum(int(d.get('broad_item_sold') or 0) for d in daily_list),
+        'broad_gmv': sum(float(d.get('broad_gmv') or 0) for d in daily_list),
+        'expense': sum(float(d.get('expense') or 0) for d in daily_list),
+    }
+
 def _daily_metric_value(daily_list, metric):
     """Hitung nilai metric dari list harian (get_all_cpc_ads_daily_performance)."""
-    if metric == 'impressions':
-        return int(sum(int(d.get('impression') or 0) for d in daily_list))
-    if metric == 'clicks':
-        return int(sum(int(d.get('clicks') or 0) for d in daily_list))
-    if metric == 'orders':
-        return int(sum(int(d.get('broad_order') or 0) for d in daily_list))
-    if metric == 'sold':
-        return int(sum(int(d.get('broad_item_sold') or 0) for d in daily_list))
-    if metric == 'sales':
-        return int(sum(float(d.get('broad_gmv') or 0) for d in daily_list))
-    if metric == 'ad_spend':
-        return int(sum(float(d.get('expense') or 0) for d in daily_list))
-    if metric == 'ctr':
-        imp = sum(int(d.get('impression') or 0) for d in daily_list)
-        clk = sum(int(d.get('clicks') or 0) for d in daily_list)
-        return round((clk / imp * 100.0) if imp else 0.0, 2)
-    if metric == 'roas':
-        spend = sum(float(d.get('expense') or 0) for d in daily_list)
-        sales = sum(float(d.get('broad_gmv') or 0) for d in daily_list)
-        return round((sales / spend) if spend else 0.0, 2)
-    return None
+    return _series_metric_value(_sum_daily(daily_list), metric)
 
 def _ads_daily_cached(from_iso, to_iso):
     """List harian metric dengan cache 30 detik (realtime-friendly)."""
@@ -994,32 +902,6 @@ def _series_metric_value(item, metric):
         spend = float(item.get('expense') or 0)
         sales = float(item.get('broad_gmv') or 0)
         return round((sales / spend) if spend else 0.0, 2)
-    return None
-
-def _series_comp_value(row, comp, metric):
-    c = row.get(comp) if isinstance(row, dict) and comp in row else row
-    imp = int(c.get('imp') or 0)
-    clk = int(c.get('clk') or 0)
-    ord_ = int(c.get('ord') or 0)
-    sold = c.get('sold')
-    gmv = float(c.get('gmv') or 0)
-    exp = float(c.get('exp') or 0)
-    if metric == 'impressions':
-        return imp
-    if metric == 'clicks':
-        return clk
-    if metric == 'orders':
-        return ord_
-    if metric == 'sold':
-        return sold
-    if metric == 'sales':
-        return int(round(gmv))
-    if metric == 'ad_spend':
-        return int(round(exp))
-    if metric == 'ctr':
-        return round((clk / imp * 100.0) if imp else 0.0, 2)
-    if metric == 'roas':
-        return round((gmv / exp) if exp else 0.0, 2)
     return None
 
 def get_metric_series(metric, start_date, end_date, interval='day', tab='product'):
