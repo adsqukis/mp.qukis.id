@@ -1,0 +1,28 @@
+# dependencies & build
+node_modules/
+dist/
+__pycache__/
+*.pyc
+
+# secrets — JANGAN pernah commit
+.env
+.env.*
+token.json
+*cookie*
+
+# data & cache runtime (bukan source)
+*_cache*.json
+ads_*.json
+orders_raw_*.json
+orders_summary_cache_*.json
+orders_daily_cache_*.json
+export_summary*.json
+daily_pull*.json
+income_cache.json
+order_export_*.xlsx
+
+# backup & log
+*.bak
+*.bak_*
+*.log
+logs/
