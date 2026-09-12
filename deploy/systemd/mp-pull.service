@@ -1,0 +1,22 @@
+# Tarik data pesanan D-1 dari Shopee API -> export_summary.json.
+# Dijalankan oleh mp-pull.timer (bukan service yang nyala terus).
+[Unit]
+Description=MP Marketplace - pull data pesanan harian (D-1)
+After=network-online.target mp-backend.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mp
+Group=mp
+WorkingDirectory=/opt/mp/backend
+EnvironmentFile=/var/lib/mp-backend/.env
+Environment=MP_DATA_DIR=/var/lib/mp-backend
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/mp/backend/pull_export.py
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/mp-backend

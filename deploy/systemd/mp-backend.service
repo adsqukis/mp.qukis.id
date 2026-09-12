@@ -1,0 +1,47 @@
+# Backend proxy Shopee untuk mpqukis.web.id.
+#
+# Install:
+#   sudo cp deploy/systemd/mp-backend.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mp-backend
+#
+# Log: journalctl -u mp-backend -f
+[Unit]
+Description=MP Marketplace backend (Shopee Open Platform proxy)
+Documentation=https://github.com/adsqukis/mp.qukis.id
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mp
+Group=mp
+WorkingDirectory=/opt/mp/backend
+
+# Kredensial Shopee. File ini milik user mp, chmod 600, TIDAK di repo.
+EnvironmentFile=/var/lib/mp-backend/.env
+# State runtime (token.json, cache, export_summary.json) dipisah dari source
+# supaya `git pull` / redeploy tidak menyentuh data.
+Environment=MP_DATA_DIR=/var/lib/mp-backend
+Environment=HOST=127.0.0.1
+Environment=PORT=5010
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/usr/bin/python3 /opt/mp/backend/app.py
+Restart=always
+RestartSec=5
+
+# Hardening: proses ini cuma butuh tulis ke data dir.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/mp-backend
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

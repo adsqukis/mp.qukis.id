@@ -1,0 +1,15 @@
+# Jalan tiap hari 06:15 WIB. Server sebaiknya di-set TZ Asia/Jakarta:
+#   sudo timedatectl set-timezone Asia/Jakarta
+# Kalau server dibiarkan UTC, ganti OnCalendar jadi 23:15 (= 06:15 WIB).
+[Unit]
+Description=Timer harian pull data pesanan MP (D-1)
+
+[Timer]
+OnCalendar=*-*-* 06:15:00
+# Kalau server sempat mati saat jadwalnya, jalankan begitu nyala.
+Persistent=true
+RandomizedDelaySec=300
+Unit=mp-pull.service
+
+[Install]
+WantedBy=timers.target

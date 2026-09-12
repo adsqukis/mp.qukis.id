@@ -1,12 +1,25 @@
 #!/usr/bin/env python3
-"""Deploy shopee-seller-hub dist ke Hostinger (mp.qukis.id) via cPanel Fileman API."""
+"""LEGACY — deploy dist/ ke Hostinger cPanel (mp.qukis.id) via Fileman API.
+
+Deploy ke mpqukis.web.id (VPS 43.156.70.224) memakai deploy/deploy.sh — nginx
+serve dist/ langsung dari server, jadi script ini tidak dipakai lagi. Disimpan
+untuk fallback ke hosting static lama.
+
+Pakai:
+  python3 backend/deploy_mp.py [DIST_DIR]
+  MP_CPANEL_TARGET=/home/<user>/public_html/<domain> python3 backend/deploy_mp.py frontend/dist
+"""
 import json, os, sys, requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cpapi
 
-DIST = '/home/ubuntu/shopee-seller-hub/dist'
-TARGET_DIR = '/home/u1734629/public_html/mp.qukis.id'
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# argv[1] menang, lalu env, lalu frontend/dist di repo ini.
+DIST = (sys.argv[1] if len(sys.argv) > 1 else None) or \
+    os.environ.get('MP_DIST') or os.path.join(REPO_ROOT, 'frontend', 'dist')
+TARGET_DIR = os.environ.get(
+    'MP_CPANEL_TARGET', '/home/u1734629/public_html/mp.qukis.id')
 
 def save_file(s, base, path_rel, content, is_text=True):
     """path_rel relatif terhadap TARGET_DIR, contoh: 'index.html' atau 'assets/index-xxx.js'"""
@@ -21,6 +34,9 @@ def save_file(s, base, path_rel, content, is_text=True):
     return d
 
 def main():
+    if not os.path.isdir(DIST):
+        raise SystemExit(f'DIST tidak ada: {DIST} (build dulu: npm run build)')
+    print(f'deploy {DIST} -> {TARGET_DIR}')
     s, base, user = cpapi.login()
     print('login ok')
 

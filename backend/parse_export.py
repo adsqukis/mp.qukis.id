@@ -219,7 +219,8 @@ def main():
     if by_produk:
         summary["by_produk"] = by_produk
 
-    out_path = args.out or os.path.join(os.path.dirname(os.path.abspath(__file__)), "export_summary.json")
+    data_dir = os.environ.get("MP_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+    out_path = args.out or os.path.join(data_dir, "export_summary.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=1)
     print(json.dumps(summary, ensure_ascii=False, indent=1))

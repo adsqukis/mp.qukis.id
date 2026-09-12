@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 Shopee Open Platform proxy backend — serve data real buat dashboard MP.
-Jalan di VPS Hermes (43.133.57.134:5010). Secret partner key TIDAK boleh di Hostinger.
+Jalan di VPS di belakang nginx (default bind 127.0.0.1:5010).
+Host/port/data dir diatur via env — lihat backend/.env.example & DEPLOY.md.
+Secret partner key hanya boleh ada di VPS (jangan di host static).
 
 VERIFIED 02 Sep 2026:
 - Signature GET data: base = pid + path + ts + access_token + shop_id
@@ -16,23 +18,55 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from collections import Counter
 
+# BASE_DIR = lokasi source code (read-only saat deploy).
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# DATA_DIR = lokasi file state yang ditulis runtime (token, cache, export, raw order).
+# Default sama dengan BASE_DIR biar kompatibel dengan cara lama; di server
+# sebaiknya dipisah (contoh: MP_DATA_DIR=/var/lib/mp-backend) supaya code dir
+# bisa di-pull ulang tanpa kehilangan data.
+DATA_DIR = os.path.abspath(os.environ.get('MP_DATA_DIR') or BASE_DIR)
+os.makedirs(DATA_DIR, exist_ok=True)
 
 # TTL cache order: 60 menit. Auto-refresh background tiap 15 menit per range (round-robin).
 ORDERS_TTL = 60 * 60
 WARM_INTERVAL = 15 * 60
-ENV_FILE = os.path.join(BASE_DIR, '.env')
-TOKEN_FILE = os.path.join(BASE_DIR, 'token.json')
+ENV_FILE = os.environ.get('MP_ENV_FILE') or os.path.join(DATA_DIR, '.env')
+TOKEN_FILE = os.environ.get('MP_TOKEN_FILE') or os.path.join(DATA_DIR, 'token.json')
 API_HOST = 'https://partner.shopeemobile.com'
 
+# Origin yang diizinkan CORS. Default '' = tidak kirim header CORS sama sekali,
+# karena deploy standar-nya same-origin (nginx proxy /api di domain yang sama).
+# Set ke origin spesifik (atau '*') cuma kalau frontend beda host.
+ALLOW_ORIGIN = os.environ.get('MP_ALLOW_ORIGIN', '')
+
+REQUIRED_ENV = ('SHOPEE_PARTNER_ID_LIVE', 'SHOPEE_PARTNER_KEY_LIVE')
+
 def load_env():
+    """Config dari ENV_FILE (kalau ada) lalu ditimpa environment process.
+
+    Urutan ini bikin systemd (EnvironmentFile / Environment=) jadi sumber
+    kebenaran di server, tapi file .env lokal tetap jalan buat dev.
+    """
     env = {}
-    with open(ENV_FILE) as f:
-        for line in f:
-            line = line.strip()
-            if '=' in line and not line.startswith('#'):
-                k, v = line.split('=', 1)
-                env[k] = v
+    try:
+        with open(ENV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if '=' in line and not line.startswith('#'):
+                    k, v = line.split('=', 1)
+                    env[k.strip()] = v.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        pass
+    for k in REQUIRED_ENV + ('SHOPEE_PARTNER_ID_TEST', 'SHOPEE_PARTNER_KEY_TEST'):
+        if os.environ.get(k):
+            env[k] = os.environ[k]
+    missing = [k for k in REQUIRED_ENV if not env.get(k)]
+    if missing:
+        raise SystemExit(
+            'Config kurang: ' + ', '.join(missing) +
+            f'. Isi {ENV_FILE} atau set environment variable-nya '
+            '(lihat backend/.env.example).'
+        )
     return env
 
 ENV = load_env()
@@ -163,7 +197,7 @@ def _load_raw_recs(from_iso, to_iso):
     import glob
     merged = []
     seen = set()
-    wanted = sorted(glob.glob(os.path.join(BASE_DIR, 'orders_raw_*.json')))
+    wanted = sorted(glob.glob(os.path.join(DATA_DIR, 'orders_raw_*.json')))
     for fp in wanted:
         m = re.match(r'orders_raw_(\d{8})_(\d{8})\.json$', os.path.basename(fp))
         if not m:
@@ -382,7 +416,7 @@ def _count_orders_between(from_ts, to_ts):
             break
     return count
 
-INCOME_CACHE = os.path.join(BASE_DIR, 'income_cache.json')
+INCOME_CACHE = os.path.join(DATA_DIR, 'income_cache.json')
 INCOME_TTL = 60 * 60  # 60 menit
 
 def fetch_escrow_payouts(days=30):
@@ -1044,7 +1078,7 @@ def _ads_hourly_for_date(date_iso):
 
 
 def _orders_cache_file(name, key):
-    return os.path.join(BASE_DIR, f'{name}_cache_{key}.json')
+    return os.path.join(DATA_DIR, f'{name}_cache_{key}.json')
 
 def _orders_cache_read(name, key):
     """Baca file cache → {'generated_at', 'data'} atau None."""
@@ -1176,16 +1210,20 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
-        self.send_header('Access-Control-Allow-Origin', '*')
+        if ALLOW_ORIGIN:
+            self.send_header('Access-Control-Allow-Origin', ALLOW_ORIGIN)
+            self.send_header('Vary', 'Origin')
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', '*')
+        if ALLOW_ORIGIN:
+            self.send_header('Access-Control-Allow-Origin', ALLOW_ORIGIN)
+            self.send_header('Vary', 'Origin')
+            self.send_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers', '*')
         self.end_headers()
 
     def do_GET(self):
@@ -1248,14 +1286,14 @@ class Handler(BaseHTTPRequestHandler):
                         if data is not None:
                             return self._send_json(data)
                         # range di luar raw yang tersedia → fallback D-1 + catatan
-                        with open(os.path.join(BASE_DIR, 'export_summary.json')) as f:
+                        with open(os.path.join(DATA_DIR, 'export_summary.json')) as f:
                             base = json.load(f)
                         base['_range_warning'] = f"Data detail {f_iso} s.d. {t_iso} belum tersedia — menampilkan D-1"
                         return self._send_json(base)
                     except Exception as e:
                         return self._send_json({'error': str(e)}, 500)
                 try:
-                    with open(os.path.join(BASE_DIR, 'export_summary.json')) as f:
+                    with open(os.path.join(DATA_DIR, 'export_summary.json')) as f:
                         return self._send_json(json.load(f))
                 except Exception as e:
                     return self._send_json({'error': str(e)}, 500)
@@ -1308,7 +1346,12 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '5010'))
+    # Default loopback: backend selalu diakses lewat reverse proxy nginx, jadi
+    # port 5010 tidak perlu terbuka ke internet. Set HOST=0.0.0.0 kalau memang
+    # mau diakses langsung dari luar (dan pastikan firewall-nya ditutup).
+    host = os.environ.get('HOST', '127.0.0.1')
     # Auto-refresh background: warm semua range default tiap 15 menit (daemon)
     threading.Thread(target=_warm_loop, daemon=True).start()
-    print(f"Shopee proxy backend on :{port} (warm loop aktif, cache {ORDERS_TTL//60} menit)")
-    ThreadingHTTPServer(('0.0.0.0', port), Handler).serve_forever()
+    print(f"Shopee proxy backend on {host}:{port} (data dir {DATA_DIR}, "
+          f"warm loop aktif, cache {ORDERS_TTL//60} menit)")
+    ThreadingHTTPServer((host, port), Handler).serve_forever()

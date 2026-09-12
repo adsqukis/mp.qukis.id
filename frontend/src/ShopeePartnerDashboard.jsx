@@ -9,6 +9,7 @@ import {
   ChevronsLeft, ChevronsRight, LayoutDashboard,
   Eye, MousePointerClick, Percent, ShoppingCart, Boxes, Banknote, TrendingUp,
 } from "lucide-react";
+import { API_BASE } from "./api";
 
 const fmtRp = (n) =>
   "Rp " + Math.round(n).toLocaleString("id-ID");
@@ -179,9 +180,9 @@ function TabOverview() {
     let active = true;
     setLoading(true);
     Promise.all([
-      fetch("https://api.qukis.id/api/export/summary").then((r) => r.json()).catch(() => null),
-      fetch("https://api.qukis.id/api/ads/overview?days=7").then((r) => r.json()).catch(() => null),
-      fetch("https://api.qukis.id/api/income/summary?days=30").then((r) => r.json()).catch(() => null),
+      fetch(API_BASE + "/api/export/summary").then((r) => r.json()).catch(() => null),
+      fetch(API_BASE + "/api/ads/overview?days=7").then((r) => r.json()).catch(() => null),
+      fetch(API_BASE + "/api/income/summary?days=30").then((r) => r.json()).catch(() => null),
     ])
       .then(([exp, ads, inc]) => {
         if (!active) return;
@@ -626,8 +627,8 @@ function TabPesanan() {
             ? (() => { const { from, to } = PRESET_DATES[range](); return `?from=${from}&to=${to}`; })()
             : "");
     Promise.all([
-      fetch(`https://api.qukis.id/api/export/summary${qs}`).then((r) => r.json()).catch(() => null),
-      fetch(`https://api.qukis.id/api/orders/daily?range=7d`).then((r) => r.json()).catch(() => ({ daily: [] })),
+      fetch(`${API_BASE}/api/export/summary${qs}`).then((r) => r.json()).catch(() => null),
+      fetch(`${API_BASE}/api/orders/daily?range=7d`).then((r) => r.json()).catch(() => ({ daily: [] })),
     ])
       .then(([sum, dl]) => {
         if (!active) return;
@@ -777,7 +778,7 @@ function TabPesanan() {
       const qs = customRange
         ? `from=${customRange.from}&to=${customRange.to}&limit=500`
         : `range=${range}&limit=500`;
-      const r = await fetch(`https://api.qukis.id/api/orders/recent?${qs}`);
+      const r = await fetch(`${API_BASE}/api/orders/recent?${qs}`);
       const d = await r.json();
       const orders = (d.orders || []).filter((o) => produkMatch(o, produk));
       const rows = [
@@ -1035,7 +1036,7 @@ function TabPenghasilan() {
   useEffect(() => {
     let active = true;
     setLoading(true);
-    fetch("https://api.qukis.id/api/income/summary?days=30")
+    fetch(API_BASE + "/api/income/summary?days=30")
       .then((r) => r.json())
       .then((d) => {
         if (!active) return;
@@ -1253,7 +1254,7 @@ function TabAds() {
   // ditampilkan "—", bukan dikarang jadi angka.
   const loadData = (active) => {
     setBusy(true);
-    const base = `https://api.qukis.id/api/ads/metric?tab=${adTab}&start_date=${dRange.from}&end_date=${dRange.to}&timezone=Asia/Jakarta`;
+    const base = `${API_BASE}/api/ads/metric?tab=${adTab}&start_date=${dRange.from}&end_date=${dRange.to}&timezone=Asia/Jakarta`;
     Promise.all(
       cards.map((c) =>
         fetch(`${base}&card=${c.id}`)
@@ -1269,7 +1270,7 @@ function TabAds() {
       setLastErr(bad ? bad.error || "ERROR" : null);
       setBusy(false);
     });
-    fetch(`https://api.qukis.id/api/ads/series?metric=${seriesMetric}&interval=day&tab=${adTab}&start_date=${dRange.from}&end_date=${dRange.to}`)
+    fetch(`${API_BASE}/api/ads/series?metric=${seriesMetric}&interval=day&tab=${adTab}&start_date=${dRange.from}&end_date=${dRange.to}`)
       .then((r) => r.json())
       .then((d) => {
         if (!active) return;

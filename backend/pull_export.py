@@ -152,7 +152,8 @@ def main():
     if by_produk:
         summary["by_produk"] = by_produk
 
-    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "export_summary.json")
+    # tulis ke data dir yang sama dengan yang dibaca app.py (MP_DATA_DIR)
+    out_path = os.path.join(sb.DATA_DIR, "export_summary.json")
     # backup dulu
     if os.path.exists(out_path):
         bak = out_path + ".bak_pull"

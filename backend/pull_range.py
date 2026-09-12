@@ -93,7 +93,8 @@ def main():
     else:
         from_d = datetime(2026, 7, 1, tzinfo=WIB)
         to_d = datetime(2026, 9, 2, tzinfo=WIB)  # inclusive
-    base = os.path.dirname(os.path.abspath(__file__))
+    # data dir yang sama dengan app.py (MP_DATA_DIR), bukan folder source
+    base = sb.DATA_DIR
     all_recs = []
     daily = []
     day = from_d

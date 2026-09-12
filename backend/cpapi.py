@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
-"""Helper cPanel qukis.id — login session + API calls.
-Dipakai untuk manage DNS zone qukis.id & upload file ke public_html.
+"""LEGACY — helper cPanel qukis.id (login session + API calls).
+
+Hanya dipakai untuk deploy lama: upload dist/ ke Hostinger public_html dan
+manage DNS zone qukis.id. Deploy ke mpqukis.web.id (VPS 43.156.70.224) TIDAK
+memakai file ini — nginx serve dist/ langsung, lihat DEPLOY.md.
+
+Kredensial dibaca dari CPANEL_ENV_FILE (default ~/.hermes/.env), dengan
+CPANEL_HOST untuk host cPanel-nya.
 """
-import json, sys, re, requests
+import json, os, sys, re, requests
+
+CPANEL_ENV_FILE = os.environ.get(
+    'CPANEL_ENV_FILE', os.path.expanduser('~/.hermes/.env'))
+CPANEL_HOST = os.environ.get('CPANEL_HOST', 'cpanel.generosindo.com:2083')
 
 def get_env(key):
-    with open('/home/ubuntu/.hermes/.env') as f:
+    if os.environ.get(key):
+        return os.environ[key]
+    with open(CPANEL_ENV_FILE) as f:
         for line in f:
             if line.startswith(key + '='):
                 return line.split('=', 1)[1].strip().strip('"')
@@ -15,14 +27,15 @@ def login():
     user = get_env('CPANEL_USER')
     pwd = get_env('CPANEL_PASS')
     s = requests.Session()
-    s.get('https://cpanel.generosindo.com:2083/login/', timeout=30)
-    r1 = s.post('https://cpanel.generosindo.com:2083/login/',
+    login_url = f'https://{CPANEL_HOST}/login/'
+    s.get(login_url, timeout=30)
+    r1 = s.post(login_url,
                 data={'user': user, 'pass': pwd}, timeout=30, allow_redirects=False)
     m = re.search(r'/cpsess(\d+)/', r1.headers.get('Location', ''))
     if not m:
         raise RuntimeError('Login gagal, no cpsess. Status: %s' % r1.status_code)
     sess = m.group(1)
-    base = 'https://cpanel.generosindo.com:2083/cpsess' + sess
+    base = f'https://{CPANEL_HOST}/cpsess' + sess
     return s, base, user
 
 def zoneedit(s, base, user, func, **params):
