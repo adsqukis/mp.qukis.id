@@ -1,19 +1,28 @@
 #!/usr/bin/env bash
-# Bootstrap VPS untuk mpqukis.web.id (target: 43.156.70.224, Ubuntu/Debian).
+# Bootstrap VPS untuk mpqukis.web.id (Ubuntu/Debian).
 #
-# Idempotent — aman dijalankan berulang. Yang dilakukan:
-#   1. install nginx, python3, node, certbot
-#   2. bikin user service `mp`, /opt/mp (source), /var/lib/mp-backend (data)
-#   3. clone/update repo, pasang unit systemd + vhost nginx
-#   4. build frontend & publish ke /var/www/mpqukis/current
+# Idempotent — aman dijalankan berulang. Cerdas soal edge proxy: kalau server
+# sudah punya Caddy (misal untuk site lain), skrip TIDAK memasang nginx dan
+# TIDAK ngambil port 80/443; site MP dipasang sebagai import file di
+# /etc/caddy/sites/. Kalau tidak ada, skrip pakai jalur nginx + certbot.
 #
-# Yang TIDAK dilakukan (sengaja, butuh rahasia/keputusan lu):
-#   - ngisi /var/lib/mp-backend/.env  (partner id + key Shopee)
+# Yang selalu dilakukan:
+#   1. deteksi edge proxy yang sudah ada
+#   2. install python3, node, dan (tergantung jalur) nginx+certbot
+#   3. bikin user service `mp`, /opt/mp (source), /var/lib/mp-backend (data)
+#   4. clone/update repo, pasang unit systemd
+#   5. pasang vhost/site block di edge proxy yang aktif
+#   6. build frontend & publish ke /var/www/mpqukis/current
+#
+# Yang sengaja TIDAK dilakukan (butuh rahasia/keputusan lu):
+#   - ngisi /var/lib/mp-backend/.env (partner id + key Shopee)
 #   - naruh /var/lib/mp-backend/token.json (hasil OAuth Shopee)
-#   - request sertifikat TLS (certbot) — jalankan setelah DNS nunjuk ke server
+#   - request sertifikat TLS di jalur nginx (jalankan certbot setelah DNS)
 #
 # Pakai:
 #   sudo bash deploy/setup-server.sh
+#   PROXY=caddy sudo bash deploy/setup-server.sh   # paksa jalur Caddy
+#   PROXY=nginx sudo bash deploy/setup-server.sh   # paksa jalur nginx
 set -euo pipefail
 
 DOMAIN="${DOMAIN:-mpqukis.web.id}"
@@ -28,16 +37,48 @@ SVC_USER="${SVC_USER:-mp}"
 
 log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 
-log "1/6 Install paket"
+log "1/6 Deteksi edge proxy + install paket"
 export DEBIAN_FRONTEND=noninteractive
+
+# Cek siapa sekarang pegang port 80/443. Kalau Caddy sudah edge, kita ikuti
+# dia — jangan pernah maksa nginx masuk dan matiin Caddy dari site lain.
+detect_proxy() {
+    if [[ -n "${PROXY:-}" ]]; then echo "$PROXY"; return; fi
+    if command -v caddy >/dev/null 2>&1 \
+       && systemctl is-active --quiet caddy 2>/dev/null; then
+        echo caddy; return
+    fi
+    if ss -ltn 'sport = :80' 2>/dev/null | awk 'NR>1{exit 0} END{exit 1}'; then
+        # Ada yang listen port 80 tapi bukan Caddy aktif — bahaya, minta manusia.
+        local owner
+        owner=$(ss -ltnp 'sport = :80' 2>/dev/null | awk 'NR>1{print $NF; exit}')
+        echo "ERROR: port 80 sudah dipakai proses lain ($owner)." >&2
+        echo "Hentikan proses itu dulu, atau set PROXY=caddy/PROXY=nginx eksplisit." >&2
+        exit 1
+    fi
+    echo nginx
+}
+PROXY_KIND=$(detect_proxy)
+echo "edge proxy: $PROXY_KIND"
+
 apt-get update -qq
-apt-get install -y -qq nginx python3 python3-requests git curl ca-certificates \
-    certbot python3-certbot-nginx
+apt-get install -y -qq python3 python3-requests git curl ca-certificates
+if [[ "$PROXY_KIND" == "nginx" ]]; then
+    apt-get install -y -qq nginx certbot python3-certbot-nginx
+fi
 if ! command -v node >/dev/null 2>&1; then
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
     apt-get install -y -qq nodejs
 fi
 node -v && python3 -V
+
+# Nginx yang tidak dipakai HARUS di-disable, biar tiap reboot tidak nyoba start
+# dan gagal — atau lebih parah, ambil port dari Caddy kalau Caddy sempat mati.
+if [[ "$PROXY_KIND" != "nginx" ]] \
+   && systemctl list-unit-files nginx.service >/dev/null 2>&1; then
+    systemctl disable --now nginx 2>/dev/null || true
+    echo "nginx.service di-disable (edge proxy: $PROXY_KIND)."
+fi
 
 log "2/6 User service + direktori"
 id -u "$SVC_USER" >/dev/null 2>&1 || useradd --system --home "$DATA_DIR" --shell /usr/sbin/nologin "$SVC_USER"
@@ -59,13 +100,17 @@ cp "$SRC_DIR"/deploy/systemd/mp-pull.service    /etc/systemd/system/
 cp "$SRC_DIR"/deploy/systemd/mp-pull.timer      /etc/systemd/system/
 systemctl daemon-reload
 
-log "5/6 Pasang vhost nginx $DOMAIN"
-cp "$SRC_DIR/deploy/nginx/${DOMAIN}.conf" "/etc/nginx/sites-available/$DOMAIN"
-ln -sfn "/etc/nginx/sites-available/$DOMAIN" "/etc/nginx/sites-enabled/$DOMAIN"
-# Default vhost nginx suka nyerobot request; matikan kalau masih ada.
-rm -f /etc/nginx/sites-enabled/default
-nginx -t
-systemctl reload nginx
+log "5/6 Pasang site di edge proxy ($PROXY_KIND)"
+if [[ "$PROXY_KIND" == "caddy" ]]; then
+    bash "$SRC_DIR/deploy/setup-caddy-site.sh"
+else
+    cp "$SRC_DIR/deploy/nginx/${DOMAIN}.conf" "/etc/nginx/sites-available/$DOMAIN"
+    ln -sfn "/etc/nginx/sites-available/$DOMAIN" "/etc/nginx/sites-enabled/$DOMAIN"
+    # Default vhost nginx suka nyerobot request; matikan kalau masih ada.
+    rm -f /etc/nginx/sites-enabled/default
+    nginx -t
+    systemctl reload nginx
+fi
 
 log "6/6 Build frontend + publish"
 bash "$SRC_DIR/deploy/deploy.sh" --skip-pull
@@ -88,9 +133,10 @@ Bootstrap selesai. Sisa langkah manual (butuh rahasia / DNS):
      sudo systemctl enable --now mp-backend mp-pull.timer
      curl -s localhost:5010/health
 
-4. Arahkan DNS A record $DOMAIN -> $SERVER_IP
-   (plus www kalau dipakai), tunggu propagasi, lalu terbitkan sertifikat:
-     sudo certbot --nginx -d $DOMAIN -d www.$DOMAIN --redirect
+4. Arahkan DNS A record $DOMAIN -> $SERVER_IP (plus www kalau dipakai).
+   $( [[ "$PROXY_KIND" == "caddy" ]] \
+      && echo "TLS diterbitkan Caddy otomatis saat request pertama ke https://$DOMAIN." \
+      || echo "Lalu terbitkan sertifikat: sudo certbot --nginx -d $DOMAIN -d www.$DOMAIN --redirect" )
 
 5. Di Shopee Open Platform: whitelist IP $SERVER_IP (kalau app pakai IP
    whitelist) dan update redirect URL OAuth ke https://$DOMAIN.

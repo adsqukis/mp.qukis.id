@@ -53,8 +53,19 @@ log "Bersihin release lama (simpan $KEEP_RELEASES terakhir)"
 ls -1dt "$WEB_DIR"/releases/*/ 2>/dev/null | tail -n "+$((KEEP_RELEASES + 1))" \
     | xargs -r rm -rf
 
-log "Reload nginx + restart backend"
-nginx -t && systemctl reload nginx
+log "Reload edge proxy + restart backend"
+# Deteksi edge proxy yang benar-benar dipakai (bisa Caddy, bisa nginx).
+if systemctl is-active --quiet caddy 2>/dev/null; then
+    caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
+    systemctl reload caddy
+    echo "caddy: reloaded"
+elif systemctl is-active --quiet nginx 2>/dev/null; then
+    nginx -t && systemctl reload nginx
+    echo "nginx: reloaded"
+else
+    echo "PERINGATAN: tidak ada Caddy maupun nginx aktif — skip reload."
+fi
+
 if systemctl is-enabled --quiet mp-backend 2>/dev/null; then
     systemctl restart mp-backend
     sleep 2

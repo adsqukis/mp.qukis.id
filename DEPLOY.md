@@ -24,14 +24,22 @@ edit kode.
 ```
                     mpqukis.web.id (443)
                             |
-                          nginx  ── /            -> /var/www/mpqukis/current  (static dist/)
-                            |     ── /api/*      -> 127.0.0.1:5010
-                            |     ── /health     -> 127.0.0.1:5010
+                    edge proxy (Caddy atau nginx — bootstrap deteksi otomatis)
+                            |     ── /            -> /var/www/mpqukis/current  (static dist/)
+                            |     ── /api/*       -> 127.0.0.1:5010
+                            |     ── /health      -> 127.0.0.1:5010
                             |
                     mp-backend.service (python app.py, bind loopback)
                             |
                     /var/lib/mp-backend  (.env, token.json, cache, export_summary.json)
 ```
+
+> **Edge proxy — Caddy vs nginx.** `setup-server.sh` deteksi apa yang sudah
+> jalan di server: kalau Caddy aktif (server multi-tenant, sudah melayani
+> domain lain), skrip pasang MP sebagai file import di `/etc/caddy/sites/`
+> tanpa nyentuh site block yang ada — TLS otomatis lewat ACME, certbot tidak
+> dipakai. Kalau tidak ada edge proxy, skrip pakai nginx + certbot seperti
+> biasa. Paksa jalur tertentu dengan `PROXY=caddy` / `PROXY=nginx`.
 
 Konsekuensinya:
 

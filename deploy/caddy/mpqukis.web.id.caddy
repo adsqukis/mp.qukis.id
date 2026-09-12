@@ -1,0 +1,54 @@
+# mpqukis.web.id — MP Marketplace Dashboard.
+#
+# Satu origin: static build React di `/`, API di `/api/*` diteruskan ke backend
+# python yang cuma listen di loopback. TLS otomatis oleh Caddy (ACME), jadi
+# tidak perlu certbot.
+#
+# File ini di-load lewat `import /etc/caddy/sites/*.caddy` di Caddyfile utama,
+# supaya site yang sudah ada (qukisriset.web.id, dll) tidak pernah tersentuh.
+# Dipasang oleh deploy/setup-caddy-site.sh.
+
+mpqukis.web.id, www.mpqukis.web.id {
+	encode zstd gzip
+
+	# Backend python. Loopback, tidak terekspos ke internet.
+	handle /api/* {
+		reverse_proxy 127.0.0.1:5010 {
+			# Endpoint Shopee (ads/orders rentang panjang) bisa lambat —
+			# beri ruang, jangan putus di tengah.
+			transport http {
+				dial_timeout 10s
+				read_timeout 120s
+			}
+		}
+	}
+
+	handle /health {
+		reverse_proxy 127.0.0.1:5010
+	}
+
+	# Static: symlink ke release aktif (ditukar atomic oleh deploy.sh).
+	handle {
+		root * /var/www/mpqukis/current
+
+		# Asset Vite pakai hash di nama file -> aman di-cache lama.
+		@asset path /assets/*
+		header @asset Cache-Control "public, max-age=31536000, immutable"
+
+		# HTML jangan di-cache, biar user langsung dapat bundle baru setelah
+		# deploy. Kalau di-cache, browser nyangkut di versi lama.
+		@html not path /assets/*
+		header @html Cache-Control "no-store, must-revalidate"
+
+		# SPA fallback: route non-file dilempar ke index.html.
+		try_files {path} /index.html
+		file_server
+	}
+
+	log {
+		output file /var/log/caddy/mpqukis.access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+	}
+}
