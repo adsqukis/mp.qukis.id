@@ -1157,7 +1157,12 @@ function TabPenghasilan() {
 
 // ---------- Card KPI Ads (spec "Cron Iklan") ----------
 // Setiap card punya ID unik → metric resmi Shopee (get_all_cpc_ads_daily_performance).
-// Iklan Toko+ (Shop Ads) TIDAK punya API publik Open Platform → SHOP_* = ENDPOINT_NOT_CONFIGURED.
+// Iklan Toko+ (Shop Ads) TIDAK punya endpoint publik terpisah di Open Platform, jadi
+// SHOP_* dihitung backend sebagai ESTIMASI (total iklan dikurangi Iklan Produk — lihat
+// _ads_shop_estimate_daily di backend/app.py), ditandai is_estimate:true di response API.
+// SOV & Produk Terjual tetap TIDAK BISA diestimasi sama sekali (lihat _SHOP_UNAVAILABLE_METRICS
+// di backend) → dua card ini selalu tampil "—", tidak pernah dikarang jadi angka.
+const SHOP_UNAVAILABLE_METRICS = ["sov", "sold"];
 const PRODUCT_CARDS = [
   { id: "PRODUCT_IMPRESSIONS", label: "Iklan Dilihat", metric: "impressions", icon: Eye, accent: "#D04C8F" },
   { id: "PRODUCT_CLICKS", label: "Jumlah Klik", metric: "clicks", icon: MousePointerClick, accent: "#875DBF" },
@@ -1241,21 +1246,16 @@ function TabAds() {
   };
 
   // Realtime load: hanya card yang aktif; request per-card ke backend (cache 30 detik).
-  // Sumber: get_all_cpc_ads_daily_performance (sama dgn "Iklan Produk" Seller Centre).
-  // Iklan Toko+ (Shop Ads) tidak punya API publik Open Platform → ENDPOINT_NOT_CONFIGURED,
-  // TIDAK ada angka palsu.
+  // Sumber tab "product": get_all_cpc_ads_daily_performance (sama dgn "Iklan Produk" Seller Centre).
+  // Sumber tab "shop": ESTIMASI backend (total iklan dikurangi Iklan Produk) — respons
+  // API selalu bawa is_estimate:true di sini, dipakai untuk badge "EST" di card & chart.
+  // SHOP_SOV & SHOP_SOLD tetap balik METRIC_NOT_AVAILABLE (gak bisa diestimasi sama sekali),
+  // ditampilkan "—", bukan dikarang jadi angka.
   const loadData = (active) => {
-    if (adTab === "shop") {
-      setMetrics(Object.fromEntries(SHOP_CARDS.map((c) => [c.id, { success: false, error: "ENDPOINT_NOT_CONFIGURED" }])));
-      setLastErr("ENDPOINT_NOT_CONFIGURED");
-      setSeries([]);
-      setBusy(false);
-      return;
-    }
     setBusy(true);
-    const base = `https://api.qukis.id/api/ads/metric?tab=product&start_date=${dRange.from}&end_date=${dRange.to}&timezone=Asia/Jakarta`;
+    const base = `https://api.qukis.id/api/ads/metric?tab=${adTab}&start_date=${dRange.from}&end_date=${dRange.to}&timezone=Asia/Jakarta`;
     Promise.all(
-      PRODUCT_CARDS.map((c) =>
+      cards.map((c) =>
         fetch(`${base}&card=${c.id}`)
           .then((r) => r.json())
           .catch(() => ({ success: false, error: "NETWORK_ERROR" }))
@@ -1265,14 +1265,16 @@ function TabAds() {
       if (!active) return;
       const obj = Object.fromEntries(entries);
       setMetrics(obj);
-      const bad = PRODUCT_CARDS.map((c) => obj[c.id]).find((m) => m && !m.success);
+      const bad = cards.map((c) => obj[c.id]).find((m) => m && !m.success);
       setLastErr(bad ? bad.error || "ERROR" : null);
       setBusy(false);
     });
-    fetch(`https://api.qukis.id/api/ads/series?metric=${seriesMetric}&interval=day&tab=product&start_date=${dRange.from}&end_date=${dRange.to}`)
+    fetch(`https://api.qukis.id/api/ads/series?metric=${seriesMetric}&interval=day&tab=${adTab}&start_date=${dRange.from}&end_date=${dRange.to}`)
       .then((r) => r.json())
       .then((d) => {
-        if (active && d && d.success) setSeries(d.points || []);
+        if (!active) return;
+        if (d && d.success) setSeries(d.points || []);
+        else setSeries([]); // metrik gak valid utk tab ini (mis. SOV/sold di shop) → jangan nampilin chart tab sebelumnya
       })
       .catch(() => {});
   };
@@ -1348,19 +1350,24 @@ function TabAds() {
 
       {adTab === "shop" && (
         <InfoNote>
-          Iklan Toko+ belum tersedia lewat API Open Platform Shopee (Shop Ads tidak punya endpoint publik).
-          Card tetap ditampilkan sebagai placeholder — tidak ada angka palsu.
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, flexWrap: "wrap" }}>
+            <Badge text="ESTIMASI" color="#B8860B" />
+            <span style={{ fontWeight: 600 }}>Angka Iklan Toko+ di bawah ini estimasi, bukan data resmi Shopee.</span>
+          </div>
+          Shopee Open Platform tidak punya endpoint Shop Ads terpisah — dihitung dari selisih
+          total iklan dikurangi Iklan Produk. SOV dan Produk Terjual tetap tidak bisa dihitung
+          sama sekali (card tampil "—"), bukan dikarang jadi nol.
         </InfoNote>
       )}
-      {lastErr && adTab === "product" && lastErr !== "METRIC_NOT_AVAILABLE" && (
+      {lastErr && lastErr !== "METRIC_NOT_AVAILABLE" && (
         <InfoNote>
           ⚠️ Status: {lastErr} — angka nggak diganti data palsu. Coba refresh / cek koneksi backend.
         </InfoNote>
       )}
       {lastErr === "METRIC_NOT_AVAILABLE" && (
         <div style={{ fontSize: 11.5, color: "#8A8A82", fontFamily: "Inter, sans-serif", marginBottom: 12 }}>
-          Catatan: Produk Terjual (& SOV) per kategori tidak disediakan API Shopee — hanya level total.
-          Card terkait tampil "—", bukan data palsu.
+          Catatan: Produk Terjual & SOV tidak disediakan API Shopee sama sekali (walau dihitung
+          selisih) — card terkait tampil "—", bukan data palsu.
         </div>
       )}
 
@@ -1370,22 +1377,32 @@ function TabAds() {
           const Icon = c.icon;
           const m = metrics[c.id];
           const ok = m && m.success;
+          const isEstimate = adTab === "shop" && ok && m.is_estimate;
+          const clickable = !(adTab === "shop" && SHOP_UNAVAILABLE_METRICS.includes(c.metric));
           return (
             <div
               key={c.id}
-              onClick={() => adTab === "product" && setSeriesMetric(c.metric)}
-              title={adTab === "product" ? "Klik untuk lihat tren harian metrik ini" : undefined}
+              onClick={() => clickable && setSeriesMetric(c.metric)}
+              title={clickable ? "Klik untuk lihat tren harian metrik ini" : "Metrik ini tidak tersedia untuk Iklan Toko+"}
               style={{
                 background: `linear-gradient(135deg, ${c.accent} 0%, ${lightenHex(c.accent)} 100%)`,
                 borderRadius: 14, padding: "16px 18px", display: "flex", flexDirection: "column", gap: 10,
                 minWidth: 0, boxShadow: `0 8px 20px ${c.accent}30`,
                 border: "1px solid rgba(255,255,255,0.18)",
-                cursor: adTab === "product" ? "pointer" : "default",
+                cursor: clickable ? "pointer" : "default",
                 opacity: busy ? 0.75 : 1, transition: "opacity .2s ease",
               }}
             >
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <span style={{ fontSize: 12.5, color: "rgba(255,255,255,0.9)", fontFamily: "Inter, sans-serif" }}>{c.label}</span>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+                  <span style={{ fontSize: 12.5, color: "rgba(255,255,255,0.9)", fontFamily: "Inter, sans-serif" }}>{c.label}</span>
+                  {isEstimate && (
+                    <span style={{
+                      fontSize: 9, fontWeight: 700, color: "#fff", background: "rgba(0,0,0,0.28)",
+                      padding: "2px 5px", borderRadius: 5, letterSpacing: 0.4, fontFamily: "Inter, sans-serif", flexShrink: 0,
+                    }} title="Estimasi: total iklan dikurangi Iklan Produk">EST</span>
+                  )}
+                </div>
                 <div style={{
                   width: 34, height: 34, borderRadius: 10, background: "rgba(255,255,255,0.22)",
                   display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
@@ -1411,9 +1428,9 @@ function TabAds() {
       </div>
 
       {/* Chart time-series (daily) — terpisah dari card; card = aggregate */}
-      {adTab === "product" && (
+      {(adTab === "product" || adTab === "shop") && (
         <Card
-          title={`Tren harian — ${metricLabel(seriesMetric)}`}
+          title={`Tren harian — ${metricLabel(seriesMetric)}${adTab === "shop" && !SHOP_UNAVAILABLE_METRICS.includes(seriesMetric) ? " (estimasi)" : ""}`}
           subtitle={`Klik salah satu card di atas untuk ganti metrik · ${displayLabel}`}
         >
           {series && series.length > 0 ? (
