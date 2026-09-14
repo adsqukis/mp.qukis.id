@@ -7,6 +7,11 @@ Shopee Open Platform API.
 - **Frontend (live):** https://mp.qukis.id (static, Hostinger cPanel)
 - **Backend (live):** https://api.qukis.id (VPS, reverse proxy ke `127.0.0.1:5010`)
 
+📚 **Mulai dari sini kalau baru pegang project ini:**
+- `CLAUDE.md` — panduan kerja untuk agent (aturan, perintah, checklist verifikasi)
+- `docs/HANDOVER_MP_QUKIS.md` — handover lengkap (arsitektur, ops, bug, manifest akses)
+- `docs/CHANGELOG.md` — riwayat perubahan
+
 ## Struktur
 
 ```
@@ -18,8 +23,11 @@ backend/           Python HTTP server (ThreadingHTTPServer) — proxy Shopee Ope
   parse_export.py  parser export xlsx Seller Centre → export_summary.json
   pull_export.py   tarik data pesanan 1 hari (D-1) dari Shopee API → export_summary.json
   pull_range.py    tarik rentang tanggal (per hari) → orders_raw_<from>_<to>.json
+  verify_raw.py    cek kelengkapan data: jumlah raw vs hitung live Shopee
   deploy_mp.py     upload dist/ ke Hostinger (cPanel API)
   cpapi.py         helper login cPanel (cPanel API session)
+ops/               script operasional (cron harian)
+docs/              handover + changelog
 ```
 
 ## Frontend
@@ -64,8 +72,8 @@ dan `token.json` (access/refresh token hasil OAuth, auto-refresh tiap ~4 jam).
 - `GET /api/shop` — info toko
 - `GET /api/orders/summary?range=...` · `/api/orders/daily` · `/api/orders/recent`
 - `GET /api/income/summary?days=30` — escrow/payout
-- `GET /api/export/summary[?from&to]` — rangkuman pesanan dari raw (D-1 default)
-- `GET /api/ads/overview?days=7|30` · `/api/ads/metric?tab=product&card=...` · `/api/ads/series?...`
+- `GET /api/export/summary[?from&to]` — rangkuman pesanan dari raw; tanggal tanpa raw (mis. hari ini) ditarik **live** dari Shopee
+- `GET /api/ads/overview?days=7|30` · `/api/ads/realtime` (hari ini per jam + saldo) · `/api/ads/metric?tab=product&card=...` · `/api/ads/series?...`
 
 Catatan: Shopee Ads API (`get_all_cpc_ads_daily_performance`) dibatasi ~30 hari/request —
 `_ads_daily_performance_range()` otomatis memecah rentang panjang jadi chunk 30 hari.
@@ -76,4 +84,8 @@ Catatan: Shopee Ads API (`get_all_cpc_ads_daily_performance`) dibatasi ~30 hari/
 cd backend
 python3 pull_export.py            # tarik D-1 → export_summary.json
 python3 pull_range.py 2026-09-05 2026-09-07   # tarik rentang → orders_raw_*.json
+python3 verify_raw.py 7           # WAJIB: cek raw vs live (exit 1 kalau ada tanggal yang kurang)
 ```
+
+Dijalankan otomatis tiap hari (09:00 WIB) oleh `ops/mp_daily_pull.sh` — pull D-1 + verifikasi kelengkapan.
+Kalau verifikasi gagal, pull ulang tanggalnya: `python3 pull_range.py <tgl> <tgl>`.

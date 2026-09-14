@@ -177,25 +177,30 @@ function TabOverview() {
 
   useEffect(() => {
     let active = true;
-    setLoading(true);
-    Promise.all([
-      fetch("https://api.qukis.id/api/export/summary").then((r) => r.json()).catch(() => null),
-      fetch("https://api.qukis.id/api/ads/overview?days=7").then((r) => r.json()).catch(() => null),
-      fetch("https://api.qukis.id/api/income/summary?days=30").then((r) => r.json()).catch(() => null),
-    ])
-      .then(([exp, ads, inc]) => {
-        if (!active) return;
-        setData({ exp: exp && !exp.error ? exp : null, ads: ads && !ads.error ? ads : null, inc: inc && !inc.error ? inc : null });
-        setError(null);
-      })
-      .catch((e) => {
-        if (!active) return;
-        setError(String(e));
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
-    return () => { active = false; };
+    const load = (showLoading) => {
+      if (showLoading) setLoading(true);
+      return Promise.all([
+        fetch("https://api.qukis.id/api/export/summary").then((r) => r.json()).catch(() => null),
+        fetch("https://api.qukis.id/api/ads/overview?days=7").then((r) => r.json()).catch(() => null),
+        fetch("https://api.qukis.id/api/income/summary?days=30").then((r) => r.json()).catch(() => null),
+      ])
+        .then(([exp, ads, inc]) => {
+          if (!active) return;
+          setData({ exp: exp && !exp.error ? exp : null, ads: ads && !ads.error ? ads : null, inc: inc && !inc.error ? inc : null });
+          setError(null);
+        })
+        .catch((e) => {
+          if (!active) return;
+          setError(String(e));
+        })
+        .finally(() => {
+          if (active) setLoading(false);
+        });
+    };
+    load(true);
+    // Auto-refresh 60 detik: angka iklan ikut update tanpa reload halaman (backend cache 60s + warmer).
+    const iv = setInterval(() => load(false), 60000);
+    return () => { active = false; clearInterval(iv); };
   }, []);
 
   if (loading) {
@@ -616,34 +621,50 @@ function TabPesanan() {
   useEffect(() => {
     let active = true;
     setLoading(true);
-    // Data card dari export summary. Kalau filter tanggal aktif → minta agregasi
-    // per range (from/to) ke backend; kalau default 7d & belum pilih custom →
-    // fetch file D-1 (export_summary.json) biar tidak berubah dari perilaku lama.
+    // Data card dari export summary: backend agregasi dari raw per tanggal + tarik
+    // LIVE dari Shopee untuk tanggal yang raw-nya belum ada (hari ini).
+    // Semua preset (termasuk 7d) kirim from/to supaya backend agregasi rentang asli —
+    // sebelumnya 7d tidak kirim apa-apa → yang tampil file D-1 (angka kemarin), bukan 7 hari.
     const qs =
       customRange
         ? `?from=${customRange.from}&to=${customRange.to}`
-        : (range && range !== "7d" && PRESET_DATES[range]
+        : (range && PRESET_DATES[range]
             ? (() => { const { from, to } = PRESET_DATES[range](); return `?from=${from}&to=${to}`; })()
             : "");
-    Promise.all([
-      fetch(`https://api.qukis.id/api/export/summary${qs}`).then((r) => r.json()).catch(() => null),
-      fetch(`https://api.qukis.id/api/orders/daily?range=7d`).then((r) => r.json()).catch(() => ({ daily: [] })),
-    ])
-      .then(([sum, dl]) => {
-        if (!active) return;
-        setExp(sum && !sum.error ? sum : null);
-        setDaily(dl.daily || []);
-        setError(null);
-      })
-      .catch((e) => {
-        if (!active) return;
-        setError(String(e));
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
+    // Chart harian ikut filter tanggal yang aktif (sebelumnya selalu 7d).
+    const dailyQs = customRange
+      ? `?range=custom&from=${customRange.from}&to=${customRange.to}`
+      : (["today", "yesterday", "7d", "30d"].includes(range)
+          ? `?range=${range}`
+          : (PRESET_DATES[range]
+              ? (() => { const { from, to } = PRESET_DATES[range](); return `?range=custom&from=${from}&to=${to}`; })()
+              : "?range=7d"));
+    const load = (showLoading) => {
+      if (showLoading) setLoading(true);
+      return Promise.all([
+        fetch(`https://api.qukis.id/api/export/summary${qs}`).then((r) => r.json()).catch(() => null),
+        fetch(`https://api.qukis.id/api/orders/daily${dailyQs}`).then((r) => r.json()).catch(() => ({ daily: [] })),
+      ])
+        .then(([sum, dl]) => {
+          if (!active) return;
+          setExp(sum && !sum.error ? sum : null);
+          setDaily(dl.daily || []);
+          setError(null);
+        })
+        .catch((e) => {
+          if (!active) return;
+          setError(String(e));
+        })
+        .finally(() => {
+          if (active) setLoading(false);
+        });
+    };
+    load(true);
+    // Auto-refresh 60 detik: tanggal yang raw-nya belum ada (hari ini) ditarik live dari Shopee.
+    const iv = setInterval(() => load(false), 60000);
     return () => {
       active = false;
+      clearInterval(iv);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [range, customRange]);
@@ -814,6 +835,12 @@ function TabPesanan() {
           fontSize: 12, color: "#8A6A3B", background: "#FFF6E6", border: "1px solid #F5E3BE",
           borderRadius: 10, padding: "9px 12px", marginBottom: 14, fontFamily: "Inter, sans-serif", lineHeight: 1.5,
         }}>⚠️ {exp._range_warning}</div>
+      )}
+      {exp && exp._live_note && (
+        <div style={{
+          fontSize: 12, color: "#3B5E8A", background: "#EEF5FF", border: "1px solid #CFE2FA",
+          borderRadius: 10, padding: "9px 12px", marginBottom: 14, fontFamily: "Inter, sans-serif", lineHeight: 1.5,
+        }}>ℹ️ {exp._live_note} Angka di-refresh otomatis tiap 60 detik.</div>
       )}
       <div style={{ display: "flex", gap: 10, marginBottom: 14, flexWrap: "wrap", alignItems: "center" }}>
         <select value={produk} onChange={(e) => setProduk(e.target.value)} style={{
@@ -1211,6 +1238,7 @@ function TabAds() {
   const [seriesMetric, setSeriesMetric] = useState("sales");
   const [busy, setBusy] = useState(true);
   const [lastErr, setLastErr] = useState(null);
+  const [rt, setRt] = useState(null); // data realtime: saldo iklan + jam terakhir
 
   const PRESET_DATES = RANGE_PRESETS;
   const clickPreset = (key) => {
@@ -1233,6 +1261,10 @@ function TabAds() {
     ? `${customRange.from.slice(8, 10)}/${customRange.from.slice(5, 7)} – ${customRange.to.slice(8, 10)}/${customRange.to.slice(5, 7)}`
     : ((RANGE_FILTERS.find((f) => f.key === range) || {}).label || range);
   const cards = adTab === "shop" ? SHOP_CARDS : PRODUCT_CARDS;
+  // Rentang 1 hari → chart pakai data PER JAM (realtime dari Shopee Ads API).
+  // Rentang >1 hari → chart harian.
+  const isSingleDay = dRange.from === dRange.to;
+  const seriesInterval = isSingleDay ? "hour" : "day";
   const metricLabel = (m) => (PRODUCT_CARDS.find((c) => c.metric === m) || {}).label || m;
 
   const fmtSeriesVal = (m, v) => {
@@ -1269,10 +1301,17 @@ function TabAds() {
       setLastErr(bad ? bad.error || "ERROR" : null);
       setBusy(false);
     });
-    fetch(`https://api.qukis.id/api/ads/series?metric=${seriesMetric}&interval=day&tab=product&start_date=${dRange.from}&end_date=${dRange.to}`)
+    fetch(`https://api.qukis.id/api/ads/series?metric=${seriesMetric}&interval=${seriesInterval}&tab=product&start_date=${dRange.from}&end_date=${dRange.to}`)
       .then((r) => r.json())
       .then((d) => {
         if (active && d && d.success) setSeries(d.points || []);
+      })
+      .catch(() => {});
+    // Freshness: saldo iklan + jam terakhir yang ada datanya (endpoint realtime, cache 30s).
+    fetch("https://api.qukis.id/api/ads/realtime")
+      .then((r) => r.json())
+      .then((d) => {
+        if (active && d && !d.error) setRt(d);
       })
       .catch(() => {});
   };
@@ -1410,11 +1449,11 @@ function TabAds() {
         })}
       </div>
 
-      {/* Chart time-series (daily) — terpisah dari card; card = aggregate */}
+      {/* Chart time-series — per jam kalau rentang 1 hari, harian kalau lebih */}
       {adTab === "product" && (
         <Card
-          title={`Tren harian — ${metricLabel(seriesMetric)}`}
-          subtitle={`Klik salah satu card di atas untuk ganti metrik · ${displayLabel}`}
+          title={`Tren ${isSingleDay ? "per jam" : "harian"} — ${metricLabel(seriesMetric)}`}
+          subtitle={`Klik salah satu card di atas untuk ganti metrik · ${displayLabel}${rt && rt.latest_hour != null ? ` · data s.d. ${String(rt.latest_hour).padStart(2, "0")}:00 WIB · saldo iklan ${fmtRp(rt.balance)}` : ""}`}
         >
           {series && series.length > 0 ? (
             <ResponsiveContainer width="100%" height={190}>

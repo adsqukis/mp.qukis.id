@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
-"""Deploy shopee-seller-hub dist ke Hostinger (mp.qukis.id) via cPanel Fileman API."""
+"""Deploy dist frontend ke hosting (cPanel Fileman API).
+
+Konfigurasi lewat env (bukan hardcode — biar repo aman publik):
+  MP_DIST        folder hasil build (default: ../frontend/dist relatif ke file ini)
+  MP_TARGET_DIR  docroot tujuan di hosting, contoh: /home/<user>/public_html/<domain>
+  CPANEL_URL / CPANEL_USER / CPANEL_PASS  (lihat cpapi.py)
+"""
 import json, os, sys, requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cpapi
 
-DIST = '/home/ubuntu/shopee-seller-hub/dist'
-TARGET_DIR = '/home/u1734629/public_html/mp.qukis.id'
+DIST = os.environ.get('MP_DIST') or cpapi.get_env('MP_DIST') or \
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'frontend', 'dist')
+TARGET_DIR = (os.environ.get('MP_TARGET_DIR') or cpapi.get_env('MP_TARGET_DIR') or '').rstrip('/')
+if not TARGET_DIR:
+    raise SystemExit('MP_TARGET_DIR belum diset (contoh: /home/<user>/public_html/<domain>)')
 
 def save_file(s, base, path_rel, content, is_text=True):
     """path_rel relatif terhadap TARGET_DIR, contoh: 'index.html' atau 'assets/index-xxx.js'"""

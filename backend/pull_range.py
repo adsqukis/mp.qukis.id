@@ -29,33 +29,79 @@ spec3.loader.exec_module(px)
 WIB = timezone(timedelta(hours=7))
 
 
-def pull_day(day_start):
-    f = int(day_start.timestamp())
-    t = int((day_start + timedelta(days=1)).timestamp())
-    all_sns = []
-    cursor = ""
-    while True:
-        r = sb.shopee_get("/api/v2/order/get_order_list", {
-            "time_range_field": "create_time", "time_from": f, "time_to": t,
-            "page_size": 100, "cursor": cursor,
-        })
-        resp = r.get("response", {})
-        lst = resp.get("order_list", [])
-        for o in lst:
-            all_sns.append(o["order_sn"])
-        if not resp.get("more", False) or not lst:
-            break
-        cursor = resp.get("next_cursor", "")
-    all_sns = list(dict.fromkeys(all_sns))
-    details = []
-    for i in range(0, len(all_sns), 50):
-        batch = all_sns[i:i + 50]
+def _get_order_list_page(params, tries=4):
+    """Satu halaman get_order_list + retry kalau respons kosong (error / rate limit)."""
+    last = None
+    for i in range(tries):
+        r = sb.shopee_get("/api/v2/order/get_order_list", params)
+        if isinstance(r.get("response"), dict):
+            return r["response"]
+        last = r
+        time.sleep(1.5 * (i + 1))
+    raise RuntimeError("get_order_list gagal %dx (respons kosong): %s" % (tries, str(last)[:200]))
+
+
+def _get_order_details(batch, tries=4):
+    """get_order_detail satu batch (maks 50 SN) + retry kalau respons kosong."""
+    last = None
+    for i in range(tries):
         r = sb.shopee_get("/api/v2/order/get_order_detail", {
             "order_sn_list": ",".join(batch),
             "response_optional_fields": "item_list,total_amount,buyer_user_id,recipient_address,package_list",
         })
-        details.extend(r.get("response", {}).get("order_list", []))
+        if isinstance(r.get("response"), dict):
+            return r["response"].get("order_list") or []
+        last = r
+        time.sleep(1.5 * (i + 1))
+    raise RuntimeError("get_order_detail gagal %dx: %s" % (tries, str(last)[:200]))
+
+
+def pull_day(day_start):
+    f = int(day_start.timestamp())
+    t = int((day_start + timedelta(days=1)).timestamp())
+
+    all_sns = []
+    cursor = ""
+    done = False
+    empty_streak = 0
+    for _ in range(300):
+        resp = _get_order_list_page({
+            "time_range_field": "create_time", "time_from": f, "time_to": t,
+            "page_size": 100, "cursor": cursor,
+        })
+        lst = resp.get("order_list") or []
+        if not lst and resp.get("more"):
+            # halaman kosong padahal masih ada next → indikasi error, coba lagi
+            empty_streak += 1
+            if empty_streak >= 3:
+                raise RuntimeError("halaman kosong berturut-turut padahal more=true — data tidak lengkap")
+            time.sleep(1.0)
+            continue
+        empty_streak = 0
+        all_sns.extend([o["order_sn"] for o in lst])
+        if not resp.get("more", False):
+            done = True
+            break
+        nxt = resp.get("next_cursor") or ""
+        if not nxt or nxt == cursor:
+            done = True
+            break
+        cursor = nxt
+    if not done:
+        raise RuntimeError("pagination tidak selesai (>300 halaman) — data kemungkinan tidak lengkap")
+
+    all_sns = list(dict.fromkeys(all_sns))
+    details = []
+    for i in range(0, len(all_sns), 50):
+        details.extend(_get_order_details(all_sns[i:i + 50]))
         time.sleep(0.2)
+
+    # Verifikasi kelengkapan: tiap order_sn harus ada detail-nya.
+    got = {str(o.get("order_sn") or "") for o in details}
+    missed = [s for s in all_sns if s not in got]
+    if missed:
+        print("WARN %s: %d dari %d order_sn tidak kembali detail-nya (contoh: %s) — data bisa kurang"
+              % (day_start.strftime("%Y-%m-%d"), len(missed), len(all_sns), missed[:3]), flush=True)
     return details
 
 

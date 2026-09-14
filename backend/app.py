@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Shopee Open Platform proxy backend — serve data real buat dashboard MP.
-Jalan di VPS Hermes (43.133.57.134:5010). Secret partner key TIDAK boleh di Hostinger.
+Jalan di VPS (port 5010, di belakang reverse proxy). Secret partner key TIDAK boleh di hosting.
 
 VERIFIED 02 Sep 2026:
 - Signature GET data: base = pid + path + ts + access_token + shop_id
@@ -21,6 +21,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # TTL cache order: 60 menit. Auto-refresh background tiap 15 menit per range (round-robin).
 ORDERS_TTL = 60 * 60
 WARM_INTERVAL = 15 * 60
+# Iklan: TTL pendek + warmer 60 detik supaya angka ads selalu ≤1 menit (12 Sep 2026).
+ADS_OVERVIEW_TTL = 60
+ADS_WARM_INTERVAL = 60
 ENV_FILE = os.path.join(BASE_DIR, '.env')
 TOKEN_FILE = os.path.join(BASE_DIR, 'token.json')
 API_HOST = 'https://partner.shopeemobile.com'
@@ -191,16 +194,177 @@ def _load_raw_recs(from_iso, to_iso):
         return None, None
     return merged, f"{from_iso}_s.d._{to_iso}"
 
+# ===== Pesanan LIVE untuk tanggal yang raw-nya belum ada (14 Sep 2026) =====
+# Masalah lama: /api/export/summary untuk hari ini (raw belum ada karena baru di-pull besok)
+# fallback ke FILE D-1 → user lihat angka kemarin walau filter "Hari ini". Sekarang tanggal
+# yang belum punya raw ditarik LANGSUNG dari Shopee API (format recs sama dengan orders_raw_*).
+LIVE_ORDERS_TTL = 300        # cache 5 menit per tanggal (data hari berjalan masih nambah)
+LIVE_MAX_DAYS = 7            # maksimal 7 tanggal terakhir di-fetch live (batasi beban API)
+
+_MODS = {}
+
+def _load_side_module(filename, key):
+    """Import modul pendamping (pull_export/parse_export) sekali, lalu di-cache."""
+    m = _MODS.get(key)
+    if m is not None:
+        return m
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(key, os.path.join(BASE_DIR, filename))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _MODS[key] = mod
+    return mod
+
+def _live_day_recs(day_iso):
+    """Tarik recs satu hari (format orders_raw: order/status/sku/jumlah/qty/tanggal) dari Shopee API.
+    Ada retry + verifikasi kelengkapan supaya tidak pernah balikin data bolong (kasus 9 Sep 2026)."""
+    px = _load_side_module('pull_export.py', 'px_side')
+    pe = _load_side_module('parse_export.py', 'pe_side')
+
+    d0 = datetime.datetime.strptime(day_iso, '%Y-%m-%d').replace(
+        tzinfo=datetime.timezone(datetime.timedelta(hours=7)))
+    f = int(d0.timestamp())
+    t = f + 86400
+
+    def _page(params, tries=4):
+        last = None
+        for i in range(tries):
+            r = shopee_get('/api/v2/order/get_order_list', params)
+            if isinstance(r.get('response'), dict):
+                return r['response']
+            last = r
+            time.sleep(1.5 * (i + 1))
+        raise RuntimeError('get_order_list gagal %dx (respons kosong): %s' % (tries, str(last)[:200]))
+
+    sns = []
+    cursor = ''
+    done = False
+    for _ in range(300):
+        resp = _page({
+            'time_range_field': 'create_time', 'time_from': f, 'time_to': t,
+            'page_size': 100, 'cursor': cursor,
+        })
+        lst = resp.get('order_list') or []
+        if not lst and not resp.get('more'):
+            done = True
+            break
+        sns.extend([o.get('order_sn') for o in lst if o.get('order_sn')])
+        if not resp.get('more', False):
+            done = True
+            break
+        nxt = resp.get('next_cursor') or ''
+        if not nxt or nxt == cursor:
+            done = True
+            break
+        cursor = nxt
+    if not done:
+        raise RuntimeError('pagination %s tidak selesai — data tidak lengkap' % day_iso)
+    sns = list(dict.fromkeys(sns))
+
+    details = []
+    for i in range(0, len(sns), 50):
+        batch = sns[i:i + 50]
+        got = None
+        last = None
+        for attempt in range(4):
+            r = shopee_get('/api/v2/order/get_order_detail', {
+                'order_sn_list': ','.join(batch),
+                'response_optional_fields': 'item_list,total_amount,buyer_user_id',
+            })
+            if isinstance(r.get('response'), dict):
+                got = r['response'].get('order_list') or []
+                break
+            last = r
+            time.sleep(1.5 * (attempt + 1))
+        if got is None:
+            raise RuntimeError('get_order_detail gagal 4x: %s' % str(last)[:200])
+        details.extend(got)
+        time.sleep(0.2)
+
+    # Verifikasi: semua SN harus punya detail. Kalau tidak → jangan diam-diam, lempar error.
+    got_sns = {str(o.get('order_sn') or '') for o in details}
+    missed = [s for s in sns if s not in got_sns]
+    if missed:
+        raise RuntimeError('detail %s tidak lengkap: %d/%d order_sn tidak kembali (contoh %s)'
+                           % (day_iso, len(missed), len(sns), missed[:3]))
+
+    recs = []
+    for o in details:
+        st = o.get('order_status') or ''
+        status = px.API_TO_EXPORT_STATUS.get(st, st or 'Lainnya')
+        osn = str(o.get('order_sn') or '').strip()
+        if not osn:
+            continue
+        for it in (o.get('item_list') or []):
+            sku = str(it.get('item_sku') or '').strip() or str(it.get('model_sku') or '').strip()
+            try:
+                jumlah = int(it.get('model_quantity_purchased') or 0)
+            except Exception:
+                jumlah = 0
+            info = pe.SKU_INFO.get(sku)
+            recs.append({
+                'order': osn,
+                'status': pe.norm_status(status),
+                'sku': sku,
+                'jumlah': jumlah,
+                'qty': jumlah * (info['bundling'] if info else 1),
+                'tanggal': day_iso,
+            })
+    return recs
+
+def _live_dates_missing(recs, from_iso, to_iso):
+    """Tanggal dalam rentang yang belum punya raw DAN masih dalam LIVE_MAX_DAYS hari terakhir."""
+    have = {r.get('tanggal') for r in (recs or []) if r.get('tanggal')}
+    today = datetime.date.today()
+    lo = today - datetime.timedelta(days=LIVE_MAX_DAYS - 1)
+    start = max(datetime.date.fromisoformat(from_iso), lo)
+    end = min(datetime.date.fromisoformat(to_iso), today)
+    out = []
+    d = start
+    while d <= end:
+        if d.isoformat() not in have:
+            out.append(d.isoformat())
+        d += datetime.timedelta(days=1)
+    return out
+
+def _merge_live_recs(recs, from_iso, to_iso):
+    """Lengkapi recs raw dengan data LIVE untuk tanggal yang belum tersedia. Return (recs, live_days)."""
+    missing = _live_dates_missing(recs, from_iso, to_iso)
+    if not missing:
+        return recs, []
+    merged = list(recs or [])
+    seen = {(r.get('tanggal'), r.get('order'), r.get('sku'), r.get('status'), r.get('jumlah'))
+            for r in merged}
+    live_days = []
+    for day in missing:
+        try:
+            got = _orders_get('live_day', day, lambda d=day: _live_day_recs(d), ttl=LIVE_ORDERS_TTL)
+        except Exception:
+            got = None
+        if not got:
+            continue
+        live_days.append(day)
+        for r in got:
+            k = (r.get('tanggal'), r.get('order'), r.get('sku'), r.get('status'), r.get('jumlah'))
+            if k not in seen:
+                seen.add(k)
+                merged.append(r)
+    return (merged if merged else None), live_days
+
 def _export_summary_for_range(from_iso, to_iso):
-    """Agregasi summary lengkap (termasuk by_produk) untuk range custom dari raw recs."""
+    """Agregasi summary lengkap (termasuk by_produk) untuk range custom dari raw recs.
+    Tanggal yang raw-nya belum ada (mis. hari ini) diisi dari Shopee API (live)."""
     import importlib.util
     spec = importlib.util.spec_from_file_location("pe", os.path.join(BASE_DIR, "parse_export.py"))
     pe = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(pe)
 
     recs, label = _load_raw_recs(from_iso, to_iso)
+    recs, live_days = _merge_live_recs(recs, from_iso, to_iso)
     if recs is None:
         return None
+    if not label:
+        label = from_iso if from_iso == to_iso else f'{from_iso}_s.d._{to_iso}'
     ts = int(time.time())
     summary = pe._summarize(recs, label, ts)
     # Kalau range diminta lebih tua dari data yang tersedia → tandai partial
@@ -220,7 +384,13 @@ def _export_summary_for_range(from_iso, to_iso):
         if sub:
             by_produk[group_label] = pe._summarize(sub, summary["tanggal_data"], ts)
     if by_produk:
-        summary["by_produk"] = by_produk
+        summary['by_produk'] = by_produk
+    if live_days:
+        summary['_live_days'] = live_days
+        summary['_live_note'] = (
+            'Tanggal ' + ', '.join(live_days) + ' ditarik live dari Shopee API '
+            '(hari berjalan — angka masih bisa berubah sampai hari selesai).'
+        )
     return summary
 
 def parse_date(s):
@@ -583,9 +753,81 @@ def _ads_overview_builder(days=7):
     }
 
 def ads_overview(days=7):
-    """Wrapper cache 60 menit. Days di-allow: 7/30."""
+    """Wrapper cache pendek (ADS_OVERVIEW_TTL=60s) biar angka iklan nggak basi 1 jam."""
     key = f'adso_{days}d'
-    return _orders_get('ads_overview', key, lambda: _ads_overview_builder(days))
+    return _orders_get('ads_overview', key, lambda: _ads_overview_builder(days), ttl=ADS_OVERVIEW_TTL)
+
+
+# ============ ADS REALTIME — hari ini, per jam (12 Sep 2026) ============
+# Sumber resmi: get_all_cpc_ads_daily_performance (harian, angka yang sama dgn Seller Centre)
+# + get_all_cpc_ads_hourly_performance (per jam berjalan) + get_total_balance + get_shop_toggle_info.
+# TTL 30 detik + di-warm background tiap 60 detik → angka selalu ≤1 menit.
+ADS_REALTIME_TTL = 30
+
+def _ads_realtime_builder():
+    today = datetime.date.today()
+    dmy = today.strftime('%d-%m-%Y')
+
+    r = shopee_get('/api/v2/ads/get_all_cpc_ads_daily_performance', {'start_date': dmy, 'end_date': dmy})
+    daily = r.get('response') if isinstance(r.get('response'), list) else []
+
+    hourly = _ads_hourly_for_date(today.strftime('%Y-%m-%d'))
+
+    bal = shopee_get('/api/v2/ads/get_total_balance').get('response') or {}
+    tog = shopee_get('/api/v2/ads/get_shop_toggle_info').get('response') or {}
+
+    def num(v):
+        try:
+            return float(v or 0)
+        except Exception:
+            return 0.0
+
+    def hnum(h, k):
+        return int(num(h.get(k)))
+
+    row = daily[0] if daily else {}
+    points = []
+    for h in hourly:
+        try:
+            hh = int(h.get('hour') or 0)
+        except Exception:
+            continue
+        points.append({
+            'hour': hh,
+            'label': f'{hh:02d}:00',
+            'expense': num(h.get('expense')),
+            'clicks': hnum(h, 'clicks'),
+            'impressions': hnum(h, 'impression'),
+            'orders': hnum(h, 'broad_order'),
+            'gmv': num(h.get('broad_gmv')),
+        })
+    points.sort(key=lambda p: p['hour'])
+
+    return {
+        'date': today.strftime('%Y-%m-%d'),
+        'today': {
+            'expense': num(row.get('expense')),
+            'clicks': hnum(row, 'clicks'),
+            'impressions': hnum(row, 'impression'),
+            'direct_order': hnum(row, 'direct_order'),
+            'broad_order': hnum(row, 'broad_order'),
+            'direct_gmv': num(row.get('direct_gmv')),
+            'broad_gmv': num(row.get('broad_gmv')),
+            'direct_roas': num(row.get('direct_roas')),
+            'broad_roas': num(row.get('broad_roas')),
+        },
+        'hourly': points,
+        'latest_hour': points[-1]['hour'] if points else None,
+        'balance': num(bal.get('total_balance')),
+        'toggle': {'auto_top_up': tog.get('auto_top_up'), 'campaign_surge': tog.get('campaign_surge')},
+        'data_timestamp': bal.get('data_timestamp') or int(time.time()),
+        'generated_at': int(time.time()),
+        'source': 'ads daily+hourly performance + total_balance + toggle_info',
+    }
+
+def ads_realtime():
+    """Cache 30 detik: cukup untuk polling UI 30 detik tanpa membanjiri Shopee API."""
+    return _orders_get('ads_realtime', 'today', _ads_realtime_builder, ttl=ADS_REALTIME_TTL)
 
 
 # ============ ADS DETAIL per kategori (Tab Ads MP) ============
@@ -1179,10 +1421,36 @@ def warm_orders_caches():
         except Exception:
             pass
 
+def warm_ads_caches():
+    """Pre-warm data iklan: realtime (hari ini) + overview 7d.
+    Ditulis langsung ke cache (bukan lewat _orders_get) supaya user selalu dapat angka fresh,
+    bukan cache basi yang baru di-refresh di belakang."""
+    try:
+        _orders_cache_save('ads_realtime', 'today', _ads_realtime_builder())
+    except Exception:
+        pass
+    time.sleep(0.5)
+    try:
+        _orders_cache_save('ads_overview', 'adso_7d', _ads_overview_builder(7))
+    except Exception:
+        pass
+
 def _warm_loop():
+    """Tiap ADS_WARM_INTERVAL (60s): warm cache iklan. Tiap WARM_INTERVAL (15m): warm cache pesanan."""
+    tick = 0
     while True:
-        time.sleep(WARM_INTERVAL)
-        warm_orders_caches()
+        time.sleep(ADS_WARM_INTERVAL)
+        tick += 1
+        try:
+            warm_ads_caches()
+        except Exception:
+            pass
+        if tick * ADS_WARM_INTERVAL >= WARM_INTERVAL:
+            tick = 0
+            try:
+                warm_orders_caches()
+            except Exception:
+                pass
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -1285,6 +1553,8 @@ class Handler(BaseHTTPRequestHandler):
                     days = 7
                 data = ads_overview(days=days)
                 return self._send_json(data)
+            elif path == '/api/ads/realtime':
+                return self._send_json(ads_realtime())
             elif path == '/api/ads/detail':
                 from_iso = qs.get('from', [''])[0]
                 to_iso = qs.get('to', [''])[0]

@@ -18,8 +18,10 @@ orders_summary_cache_*.json
 orders_daily_cache_*.json
 export_summary*.json
 daily_pull*.json
+live_day_cache_*.json
 income_cache.json
 order_export_*.xlsx
+*.xlsx
 
 # backup & log
 *.bak
