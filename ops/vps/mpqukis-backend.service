@@ -1,0 +1,21 @@
+[Unit]
+Description=MP QuKis backend (Shopee proxy) untuk mpqukis.web.id
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Ganti user & path sesuai VPS lu (harus sama dengan BACKEND_DIR di workflow).
+User=REPLACE_WITH_VPS_USER
+WorkingDirectory=/home/REPLACE_WITH_VPS_USER/mpqukis-backend
+Environment=PORT=5010
+# app.py baca backend/.env + token.json dari WorkingDirectory ini.
+ExecStart=/usr/bin/python3 app.py
+Restart=always
+RestartSec=3
+# Hardening ringan
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

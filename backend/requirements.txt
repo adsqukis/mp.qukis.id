@@ -1,0 +1,4 @@
+# Server inti (app.py) murni stdlib — dependency di bawah cuma dipakai
+# modul pendamping (pull_export/parse_export/cpapi) di jalur tertentu.
+requests>=2.31.0
+openpyxl>=3.1.0

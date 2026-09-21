@@ -1,0 +1,93 @@
+name: Deploy ke VPS (mpqukis.web.id)
+
+# Kapan jalan:
+#  - Manual: tab Actions -> "Deploy ke VPS" -> Run workflow
+#  - Otomatis: tiap push ke main yang menyentuh frontend/ atau backend/
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - "backend/**"
+      - ".github/workflows/deploy-vps.yml"
+
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci --registry=https://registry.npmjs.org/
+          npm run build
+
+      - name: Setup SSH
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          PORT="${{ secrets.VPS_PORT }}"; PORT="${PORT:-22}"
+          ssh-keyscan -p "$PORT" -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Deploy frontend (rsync dist -> docroot)
+        run: |
+          set -euo pipefail
+          PORT="${{ secrets.VPS_PORT }}"; PORT="${PORT:-22}"
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/id_deploy -p $PORT" \
+            frontend/dist/ \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:${{ vars.FRONTEND_DOCROOT }}/"
+
+      - name: Deploy backend (rsync *.py, JANGAN sentuh .env/token/data)
+        run: |
+          set -euo pipefail
+          PORT="${{ secrets.VPS_PORT }}"; PORT="${PORT:-22}"
+          # Hanya kirim kode Python + requirements. Tanpa --delete supaya
+          # .env, token.json, dan file data (*_cache_*.json, orders_raw_*.json,
+          # export_summary*.json) di VPS TIDAK terhapus/tertimpa.
+          rsync -az \
+            --include="*.py" --include="requirements.txt" --exclude="*" \
+            -e "ssh -i ~/.ssh/id_deploy -p $PORT" \
+            backend/ \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:${{ vars.BACKEND_DIR }}/"
+
+      - name: Restart backend + health check
+        run: |
+          set -euo pipefail
+          PORT="${{ secrets.VPS_PORT }}"; PORT="${PORT:-22}"
+          ssh -i ~/.ssh/id_deploy -p "$PORT" \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+            "BACKEND_DIR='${{ vars.BACKEND_DIR }}' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd "${BACKEND_DIR:-$HOME/mpqukis-backend}" 2>/dev/null || true
+          # Pasang dep opsional bila ada requirements (aman kalau sudah terpasang).
+          if [ -f requirements.txt ]; then
+            python3 -m pip install --user -q -r requirements.txt || true
+          fi
+          # Restart service (butuh sudoers NOPASSWD utk perintah ini — lihat DEPLOY_VPS.md).
+          sudo systemctl restart mpqukis-backend
+          sleep 2
+          sudo systemctl is-active mpqukis-backend
+          # Health check lewat nginx.
+          code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1/health || echo 000)
+          echo "health via nginx -> HTTP $code"
+          test "$code" = "200"
+          REMOTE
+
+      - name: Ringkasan
+        if: always()
+        run: echo "Selesai. Cek https://mpqukis.web.id"
