@@ -1,6 +1,7 @@
-// DATA DUMMY — bukan data toko real. Dipakai buat preview visual sebelum backend
-// (Shopee live) disambungkan. Generator deterministik (bukan Math.random) biar
-// angka stabil tiap reload, bukan berubah-ubah acak.
+// DATA DUMMY — bukan data toko real. Generator deterministik (bukan Math.random),
+// mencakup 370 hari ke belakang biar semua preset filter (termasuk "Tahun") punya
+// data buat ditampilin. Harga per SKU (PRICE_MAP) juga angka contoh, bukan harga
+// katalog asli — cuma buat isi kolom "Total" di tabel/CSV.
 
 function mulberry32(seed) {
   return function () {
@@ -12,7 +13,7 @@ function mulberry32(seed) {
   };
 }
 
-const rand = mulberry32(20260914);
+const rand = mulberry32(918273645);
 const pick = (arr) => arr[Math.floor(rand() * arr.length)];
 
 const STATUS_WEIGHTS = [
@@ -33,19 +34,63 @@ const SKU_WEIGHTS = [
   "GenMilkVnl-03", "GenMilkMadu-03",
 ];
 
+export const PRICE_MAP = {
+  "QKS-GEN01": 85000,
+  "QKS-GEN02": 155000,
+  "QKS-GEN03": 215000,
+  "QKS-GEN1": 150000,
+  "GenMilkVnl-01": 45000,
+  "GenMilkMadu-01": 45000,
+  "GenMilkVnl-02": 85000,
+  "GenMilkMadu-02": 85000,
+  "GenMilkVnl-03": 120000,
+  "GenMilkMadu-03": 120000,
+};
+
+const FIRST_NAMES = ["Rina", "Dimas", "Nadia", "Budi", "Alya", "Fajar", "Sinta", "Yoga", "Putri", "Andi", "Maya", "Rian", "Dewi", "Bayu", "Citra", "Eko", "Farah", "Galih", "Hana", "Irfan"];
+const INITIALS = ["A.", "B.", "D.", "F.", "H.", "K.", "M.", "N.", "P.", "R.", "S.", "T.", "W."];
+const buyerName = (idx) => `${FIRST_NAMES[idx % FIRST_NAMES.length]} ${INITIALS[(idx * 7) % INITIALS.length]}`;
+
+const DAYS_BACK = 370;
+
 function buildMockOrders() {
   const recs = [];
-  for (let i = 1; i <= 230; i++) {
-    const orderNo = "SO" + String(2509000 + i).padStart(9, "0");
-    const status = pick(STATUS_WEIGHTS);
-    const lineCount = rand() < 0.22 ? 2 : 1; // ~22% order multi-SKU: nunjukin Customer != jumlah baris
-    const used = new Set();
-    for (let l = 0; l < lineCount; l++) {
-      const sku = pick(SKU_WEIGHTS);
-      if (used.has(sku)) continue;
-      used.add(sku);
-      const jumlah = 1 + Math.floor(rand() * 3);
-      recs.push({ order: orderNo, sku, jumlah, status });
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  let n = 1;
+
+  for (let i = DAYS_BACK - 1; i >= 0; i--) {
+    const day = new Date(today);
+    day.setDate(day.getDate() - i);
+    const dow = day.getDay();
+    const boost = dow === 0 || dow === 6 ? 1.3 : 1;
+    const ordersToday = Math.max(1, Math.round((4 + rand() * 5) * boost));
+
+    for (let k = 0; k < ordersToday; k++) {
+      const orderNo = "SO" + String(2400000 + n).padStart(9, "0");
+      const status = pick(STATUS_WEIGHTS);
+      const ts = new Date(day);
+      ts.setHours(Math.floor(rand() * 24), Math.floor(rand() * 60), 0, 0);
+      const lineCount = rand() < 0.18 ? 2 : 1;
+      const used = new Set();
+      const buyer = buyerName(n);
+
+      for (let l = 0; l < lineCount; l++) {
+        const sku = pick(SKU_WEIGHTS);
+        if (used.has(sku)) continue;
+        used.add(sku);
+        const jumlah = 1 + Math.floor(rand() * 3);
+        recs.push({
+          order: orderNo,
+          sku,
+          jumlah,
+          status,
+          ts: ts.getTime(),
+          buyer,
+          total: jumlah * (PRICE_MAP[sku] || 50000),
+        });
+      }
+      n++;
     }
   }
   return recs;

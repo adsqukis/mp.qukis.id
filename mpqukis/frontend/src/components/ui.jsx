@@ -1,16 +1,26 @@
 import React from "react";
 
-export function StatCard({ icon: Icon, label, value, accent = "#4a3aa7", sub }) {
+// toggle=true buat kartu yang bisa diklik buat nyusun "Total" manual (dim + border putus-putus
+// pas non-aktif) — dipakai di Pesanan. Tanpa toggle, StatCard selalu tampil aktif (kartu display biasa).
+export function StatCard({ icon: Icon, label, value, accent = "#4a3aa7", sub, toggle = false, active = true, onClick }) {
+  const dimmed = toggle && !active;
   return (
     <div
+      onClick={onClick}
+      title={onClick ? (active ? "Klik untuk lepas dari Total" : "Klik untuk tambah ke Total") : undefined}
       style={{
         background: `linear-gradient(135deg, ${accent} 0%, ${accent}b3 100%)`,
+        border: dimmed ? "1.5px dashed rgba(255,255,255,0.6)" : "1px solid rgba(255,255,255,0.14)",
         borderRadius: 16,
         padding: "18px 20px",
         display: "flex",
         flexDirection: "column",
         gap: 8,
-        boxShadow: `0 10px 24px ${accent}33`,
+        boxShadow: dimmed ? "none" : `0 10px 24px ${accent}33`,
+        opacity: dimmed ? 0.45 : 1,
+        cursor: onClick ? "pointer" : "default",
+        userSelect: onClick ? "none" : "auto",
+        transition: "opacity .15s ease, box-shadow .15s ease",
         minWidth: 0,
       }}
     >
@@ -22,7 +32,7 @@ export function StatCard({ icon: Icon, label, value, accent = "#4a3aa7", sub }) 
           </div>
         )}
       </div>
-      <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 26, fontWeight: 600, color: "#fff", letterSpacing: "-0.01em" }}>{value}</div>
+      <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 26, fontWeight: 600, color: "#fff", letterSpacing: "-0.01em", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{value}</div>
       {sub && <div style={{ fontSize: 11.5, color: "rgba(255,255,255,0.78)", fontFamily: "Inter, sans-serif" }}>{sub}</div>}
     </div>
   );
@@ -42,6 +52,19 @@ export function Card({ title, subtitle, children, right }) {
       )}
       {children}
     </div>
+  );
+}
+
+export function Badge({ text, color = "#898781" }) {
+  return (
+    <span
+      style={{
+        fontSize: 11.5, fontWeight: 600, color, background: color + "17",
+        padding: "3px 9px", borderRadius: 6, fontFamily: "Inter, sans-serif", whiteSpace: "nowrap",
+      }}
+    >
+      {text}
+    </span>
   );
 }
 
