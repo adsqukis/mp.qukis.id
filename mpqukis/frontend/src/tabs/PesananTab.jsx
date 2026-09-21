@@ -4,8 +4,7 @@ import { Card, StatCard, Pill } from "../components/ui";
 import { summarize } from "../lib/summarize";
 import { mockOrders } from "../lib/mockOrders";
 import { STATUS_COLOR, PRODUCT_GROUPS } from "../lib/skuMaster";
-
-const fmtInt = (n) => (n ?? 0).toLocaleString("id-ID");
+import { fmtInt } from "../lib/format";
 
 export default function PesananTab() {
   const summary = useMemo(() => summarize(mockOrders), []);

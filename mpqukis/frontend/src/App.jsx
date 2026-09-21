@@ -4,6 +4,7 @@ import {
   ChevronsLeft, ChevronsRight, Search, Bell, Sparkles,
 } from "lucide-react";
 import PesananTab from "./tabs/PesananTab";
+import PenghasilanTab from "./tabs/PenghasilanTab";
 import { ComingSoon } from "./components/ui";
 
 const MENU = [
@@ -137,7 +138,9 @@ export default function App() {
           </div>
 
           <div className="mq-content" style={{ flex: 1, minHeight: 0, padding: "22px 26px", overflowY: "auto" }}>
-            {tab === "pesanan" ? <PesananTab /> : <ComingSoon label={TITLES[tab][0]} />}
+            {tab === "pesanan" && <PesananTab />}
+            {tab === "penghasilan" && <PenghasilanTab />}
+            {tab !== "pesanan" && tab !== "penghasilan" && <ComingSoon label={TITLES[tab][0]} />}
           </div>
         </div>
       </div>

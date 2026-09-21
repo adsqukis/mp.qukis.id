@@ -72,6 +72,17 @@ export function Pill({ active, color, label, count, onClick }) {
   );
 }
 
+// Buat disclosure jujur soal data yang gak bisa diambil dari API (bukan error,
+// bukan diisi angka karangan) — pola yang sama kayak "Saldo Shopee" di mp.qukis.id.
+export function Notice({ title = "Data tidak tersedia", children }) {
+  return (
+    <div style={{ border: "1px dashed #e6c9a8", background: "#FAFAF7", borderRadius: 10, padding: "12px 14px" }}>
+      <div style={{ fontSize: 12.5, color: "#a8642f", fontWeight: 600, marginBottom: 4, fontFamily: "Inter, sans-serif" }}>{title}</div>
+      <div style={{ fontSize: 12, color: "#6b6a63", lineHeight: 1.5, fontFamily: "Inter, sans-serif" }}>{children}</div>
+    </div>
+  );
+}
+
 export function ComingSoon({ label }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "90px 20px", gap: 6, textAlign: "center" }}>
