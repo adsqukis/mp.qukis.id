@@ -890,20 +890,6 @@ def _ads_campaign_perf_batch(campaign_ids, from_iso, to_iso):
             out[c.get('campaign_id')] = c.get('metrics_list') or []
         return True
 
-    # batch gagal → coba setengah-setengah (rekursif) utk isolasi id jelek.
-    # Didefinisikan sekali di luar loop (sebelumnya re-defined tiap iterasi).
-    def split_fetch(lst):
-        if len(lst) == 1:
-            if fetch_batch(lst) is None:
-                bad.append(lst[0])
-            return
-        mid = len(lst) // 2
-        a, b = lst[:mid], lst[mid:]
-        if fetch_batch(a) is None:
-            split_fetch(a)
-        if fetch_batch(b) is None:
-            split_fetch(b)
-
     for i in range(0, len(campaign_ids), 100):
         batch = campaign_ids[i:i + 100]
         if len(batch) <= 1:
@@ -912,16 +898,41 @@ def _ads_campaign_perf_batch(campaign_ids, from_iso, to_iso):
             continue
         if fetch_batch(batch) is not None:
             continue
+        # batch gagal → coba setengah-setengah (rekursif) utk isolasi id jelek
+        def split_fetch(lst):
+            if len(lst) == 1:
+                if fetch_batch(lst) is None:
+                    bad.append(lst[0])
+                return
+            mid = len(lst) // 2
+            a, b = lst[:mid], lst[mid:]
+            if fetch_batch(a) is None:
+                split_fetch(a)
+            if fetch_batch(b) is None:
+                split_fetch(b)
         split_fetch(batch)
     return out
 
-def _ads_detail_builder(from_iso, to_iso):
-    """Data lengkap Tab Ads: total shop-level + agregasi per kategori placement.
+def _agg_metrics(perf_map, campaign_ids):
+    exp = klik = imp = closing = gmv = 0.0
+    for cid in campaign_ids:
+        for m in perf_map.get(cid, []):
+            exp += float(m.get('expense') or 0)
+            klik += int(m.get('clicks') or 0)
+            imp += int(m.get('impression') or 0)
+            closing += int(m.get('broad_order') or 0)
+            gmv += float(m.get('broad_gmv') or 0)
+    return {
+        'budget': round(exp),
+        'klik': int(klik),
+        'closing': int(closing),
+        'gmv': round(gmv),
+        'roas': round(gmv / exp, 2) if exp > 0 else None,
+        'impression': int(imp),
+    }
 
-    Catatan: endpoint ini (/api/ads/detail) TIDAK dipanggil frontend saat ini
-    (Tab Ads pakai /api/ads/metric + /api/ads/series, arsitektur card-based).
-    Dibiarkan aktif kalau ada konsumen lain (laporan terpisah, dsb) — kalau
-    memang gak dipakai, aman dihapus bareng ads_detail() & handler di do_GET."""
+def _ads_detail_builder(from_iso, to_iso):
+    """Data lengkap Tab Ads: total shop-level + agregasi per kategori placement."""
     daily = _ads_daily_performance_range(from_iso, to_iso)
     cams = _ads_campaign_list()
     ids = [c.get('campaign_id') for c in cams if c.get('campaign_id')]
@@ -1028,6 +1039,84 @@ _ADS_CARDS = {
     },
 }
 
+# Catatan jujur yang ikut dikirim ke UI kalau angkanya hasil estimasi selisih.
+_ADS_ESTIMATE_NOTE = ('Estimasi: total iklan Shopee dikurangi Iklan Produk. '
+                      'Shopee tidak menyediakan API terpisah untuk Iklan Toko+.')
+
+# Komponen split per tanggal: total (get_all) | product (campaign product) | shop (selisih).
+def _ads_split_series(from_iso, to_iso):
+    daily = _ads_daily_performance_range(from_iso, to_iso)
+    cams = _ads_campaign_list()
+    ids = [c.get('campaign_id') for c in cams if c.get('campaign_id')]
+    perf = _ads_campaign_perf_batch(ids, from_iso, to_iso) if ids else {}
+    prod_by_date = {}
+    for ml in perf.values():
+        for m in ml:
+            key = m.get('date')
+            a = prod_by_date.setdefault(key, {'imp': 0, 'clk': 0, 'ord': 0, 'gmv': 0.0, 'exp': 0.0})
+            a['imp'] += int(m.get('impression') or 0)
+            a['clk'] += int(m.get('clicks') or 0)
+            a['ord'] += int(m.get('broad_order') or 0)
+            a['gmv'] += float(m.get('broad_gmv') or 0)
+            a['exp'] += float(m.get('expense') or 0)
+    out = []
+    for d in daily:
+        key = d.get('date')
+        p = prod_by_date.get(key, {'imp': 0, 'clk': 0, 'ord': 0, 'gmv': 0.0, 'exp': 0.0})
+        tot = {
+            'imp': int(d.get('impression') or 0), 'clk': int(d.get('clicks') or 0),
+            'ord': int(d.get('broad_order') or 0), 'sold': int(d.get('broad_item_sold') or 0),
+            'gmv': float(d.get('broad_gmv') or 0), 'exp': float(d.get('expense') or 0),
+        }
+        # item_sold TIDAK tersedia per-campaign → sold per komponen = None (jangan dikarang)
+        out.append({
+            'date': key,
+            'total': tot,
+            'product': {'imp': p['imp'], 'clk': p['clk'], 'ord': p['ord'], 'sold': None,
+                        'gmv': p['gmv'], 'exp': p['exp']},
+            'shop': {'imp': max(0, tot['imp'] - p['imp']), 'clk': max(0, tot['clk'] - p['clk']),
+                     'ord': max(0, tot['ord'] - p['ord']), 'sold': None,
+                     'gmv': max(0.0, tot['gmv'] - p['gmv']), 'exp': max(0.0, tot['exp'] - p['exp'])},
+        })
+    return out
+
+def _ads_split_cached(from_iso, to_iso):
+    key = f'adss_{from_iso}_{to_iso}'
+    return _orders_get('ads_split', key, lambda: _ads_split_series(from_iso, to_iso), ttl=ADS_METRIC_TTL)
+
+def _agg_comp(rows, comp):
+    a = {'imp': 0, 'clk': 0, 'ord': 0, 'sold': None, 'gmv': 0.0, 'exp': 0.0}
+    if not rows:
+        return a
+    a['imp'] = sum(r[comp]['imp'] for r in rows)
+    a['clk'] = sum(r[comp]['clk'] for r in rows)
+    a['ord'] = sum(r[comp]['ord'] for r in rows)
+    a['gmv'] = sum(r[comp]['gmv'] for r in rows)
+    a['exp'] = sum(r[comp]['exp'] for r in rows)
+    solds = [r[comp]['sold'] for r in rows if r[comp]['sold'] is not None]
+    a['sold'] = sum(solds) if solds else None
+    return a
+
+def _comp_metric_value(agg, metric):
+    imp, clk, ord_, sold, gmv, exp = agg['imp'], agg['clk'], agg['ord'], agg['sold'], agg['gmv'], agg['exp']
+    if metric == 'impressions':
+        return imp
+    if metric == 'clicks':
+        return clk
+    if metric == 'orders':
+        return ord_
+    if metric == 'sold':
+        return sold  # None kalau tidak tersedia per komponen
+    if metric == 'sales':
+        return int(round(gmv))
+    if metric == 'ad_spend':
+        return int(round(exp))
+    if metric == 'ctr':
+        return round((clk / imp * 100.0) if imp else 0.0, 2)
+    if metric == 'roas':
+        return round((gmv / exp) if exp else 0.0, 2)
+    return None
+
 def _fmt_metric_value(value, kind):
     if kind == 'money':
         return "Rp" + f"{int(round(value)):,}".replace(',', '.')
@@ -1043,99 +1132,34 @@ def _fmt_metric_value(value, kind):
         return f"{(v / 1_000):.1f}".replace('.', ',') + "rb"
     return f"{v:,}".replace(',', '.')
 
-def _sum_daily(daily_list):
-    """Jumlahkan list harian (get_all_cpc_ads_daily_performance) jadi satu item
-    agregat berbentuk sama seperti 1 baris Shopee — biar bisa dipakai ulang oleh
-    _series_metric_value (rumus ctr/roas/dst jadi satu-satunya sumber, gak ke-copy)."""
-    return {
-        'impression': sum(int(d.get('impression') or 0) for d in daily_list),
-        'clicks': sum(int(d.get('clicks') or 0) for d in daily_list),
-        'broad_order': sum(int(d.get('broad_order') or 0) for d in daily_list),
-        'broad_item_sold': sum(int(d.get('broad_item_sold') or 0) for d in daily_list),
-        'broad_gmv': sum(float(d.get('broad_gmv') or 0) for d in daily_list),
-        'expense': sum(float(d.get('expense') or 0) for d in daily_list),
-    }
-
 def _daily_metric_value(daily_list, metric):
     """Hitung nilai metric dari list harian (get_all_cpc_ads_daily_performance)."""
-    return _series_metric_value(_sum_daily(daily_list), metric)
+    if metric == 'impressions':
+        return int(sum(int(d.get('impression') or 0) for d in daily_list))
+    if metric == 'clicks':
+        return int(sum(int(d.get('clicks') or 0) for d in daily_list))
+    if metric == 'orders':
+        return int(sum(int(d.get('broad_order') or 0) for d in daily_list))
+    if metric == 'sold':
+        return int(sum(int(d.get('broad_item_sold') or 0) for d in daily_list))
+    if metric == 'sales':
+        return int(sum(float(d.get('broad_gmv') or 0) for d in daily_list))
+    if metric == 'ad_spend':
+        return int(sum(float(d.get('expense') or 0) for d in daily_list))
+    if metric == 'ctr':
+        imp = sum(int(d.get('impression') or 0) for d in daily_list)
+        clk = sum(int(d.get('clicks') or 0) for d in daily_list)
+        return round((clk / imp * 100.0) if imp else 0.0, 2)
+    if metric == 'roas':
+        spend = sum(float(d.get('expense') or 0) for d in daily_list)
+        sales = sum(float(d.get('broad_gmv') or 0) for d in daily_list)
+        return round((sales / spend) if spend else 0.0, 2)
+    return None
 
 def _ads_daily_cached(from_iso, to_iso):
     """List harian metric dengan cache 30 detik (realtime-friendly)."""
     key = f'adsdly_{from_iso}_{to_iso}'
     return _orders_get('ads_daily_metric', key, lambda: _ads_daily_performance_range(from_iso, to_iso), ttl=ADS_METRIC_TTL)
-
-# ============ Iklan Toko+ (Shop Ads) — ESTIMASI via selisih ============
-# Open Platform TIDAK punya endpoint shop-ads terpisah. Estimasi = total iklan
-# shop-level (get_all_cpc_ads_daily_performance, mencakup semua jenis ads) DIKURANGI
-# Iklan Produk (agregat get_product_campaign_daily_performance per campaign, semua
-# campaign product ads). Hasilnya SELALU dilabeli is_estimate=True di response API
-# supaya frontend wajib nampilin badge "Estimasi" — jangan pernah ditampilkan
-# seolah data resmi Shopee.
-#
-# Keterbatasan yang JUJUR ditolak (bukan dikarang jadi 0), lihat pemakaian di
-# get_dashboard_metric/get_metric_series:
-#   - SOV (share of voice): Shopee sama sekali gak expose data impression-share.
-#   - sold/box (item terjual): get_product_campaign_daily_performance TIDAK
-#     mengembalikan field ini per campaign, jadi gak ada apa pun buat dikurangkan
-#     dari total → tidak bisa dipisah, bukan berarti nol.
-#   - interval per jam: get_product_campaign_daily_performance cuma harian, gak
-#     ada versi per-jam → estimasi shop gak bisa dipecah per jam.
-def _ads_shop_estimate_daily(from_iso, to_iso):
-    """Selisih harian (total - Iklan Produk) per tanggal, di-clamp ke 0.
-
-    Clamp per-hari (bukan cuma di total akhir) supaya chart gak pernah nunjukkin
-    garis negatif kalau ada mismatch kecil waktu sync antar dua endpoint Shopee —
-    lalu semua turunan (card total, dsb) dihitung dari hasil harian yang sama ini
-    (via _sum_daily/_daily_metric_value) biar chart & card selalu konsisten satu
-    sama lain, gak dihitung dua cara terpisah yang bisa beda angka."""
-    total = _ads_daily_performance_range(from_iso, to_iso)
-    cams = _ads_campaign_list()
-    ids = [c.get('campaign_id') for c in cams if c.get('campaign_id')]
-    perf = _ads_campaign_perf_batch(ids, from_iso, to_iso) if ids else {}
-    prod_by_date = {}
-    for metrics_list in perf.values():
-        for m in metrics_list:
-            key = m.get('date')
-            a = prod_by_date.setdefault(key, {
-                'impression': 0, 'clicks': 0, 'broad_order': 0,
-                'broad_gmv': 0.0, 'expense': 0.0,
-            })
-            a['impression'] += int(m.get('impression') or 0)
-            a['clicks'] += int(m.get('clicks') or 0)
-            a['broad_order'] += int(m.get('broad_order') or 0)
-            a['broad_gmv'] += float(m.get('broad_gmv') or 0)
-            a['expense'] += float(m.get('expense') or 0)
-    out = []
-    for d in total:
-        key = d.get('date')
-        p = prod_by_date.get(key) or {
-            'impression': 0, 'clicks': 0, 'broad_order': 0,
-            'broad_gmv': 0.0, 'expense': 0.0,
-        }
-        # Sengaja TANPA 'broad_item_sold' — lihat catatan di atas kenapa 'sold'
-        # gak bisa diestimasi, dan sengaja ditolak sebelum sampai ke sini.
-        out.append({
-            'date': key,
-            'impression': max(0, int(d.get('impression') or 0) - p['impression']),
-            'clicks': max(0, int(d.get('clicks') or 0) - p['clicks']),
-            'broad_order': max(0, int(d.get('broad_order') or 0) - p['broad_order']),
-            'broad_gmv': max(0.0, float(d.get('broad_gmv') or 0) - p['broad_gmv']),
-            'expense': max(0.0, float(d.get('expense') or 0) - p['expense']),
-        })
-    return out
-
-def _ads_shop_estimate_cached(from_iso, to_iso):
-    """Cache 30 detik, pola sama seperti _ads_daily_cached."""
-    key = f'adsshopest_{from_iso}_{to_iso}'
-    return _orders_get('ads_shop_estimate', key, lambda: _ads_shop_estimate_daily(from_iso, to_iso), ttl=ADS_METRIC_TTL)
-
-_ADS_ESTIMATE_NOTE = ('Estimasi: dihitung dari selisih total iklan dikurangi Iklan Produk — '
-                      'Shopee Open Platform tidak menyediakan data Iklan Toko (Shop Ads) secara terpisah.')
-
-# Metric yang TIDAK bisa dihitung sama sekali untuk tab shop, walau via estimasi selisih
-# (lihat penjelasan di atas _ads_shop_estimate_daily) — jangan dikarang jadi 0.
-_SHOP_UNAVAILABLE_METRICS = {'sov', 'sold'}
 
 def _iso_to_dmy(iso):
     try:
@@ -1162,29 +1186,30 @@ def get_dashboard_metric(tab, card, start_date, end_date, timezone='Asia/Jakarta
             'updated_at': now_wib.strftime('%Y-%m-%dT%H:%M:%S+07:00'),
         }
 
-    # tab 'shop' (Iklan Toko+) = ESTIMASI selisih (lihat _ads_shop_estimate_daily).
-    # tab lain di luar 'product'/'shop' tidak dikenal sama sekali.
     if tab not in ('product', 'shop'):
         return err_resp('ENDPOINT_NOT_CONFIGURED')
     cards = _ADS_CARDS.get(tab)
     if card not in cards:
         return err_resp('ENDPOINT_NOT_CONFIGURED')
     metric, kind = cards[card]
-    if tab == 'shop' and metric in _SHOP_UNAVAILABLE_METRICS:
-        # SOV & sold/box gak bisa diestimasi sama sekali — lihat catatan di
-        # _ads_shop_estimate_daily. Jangan dikarang jadi 0.
+    if metric == 'sov':
+        # SOV tidak punya angka pembanding di API → tidak bisa diestimasi. Jangan dikarang.
         return err_resp('METRIC_NOT_AVAILABLE')
     try:
-        daily = _ads_shop_estimate_cached(start_date, end_date) if tab == 'shop' else _ads_daily_cached(start_date, end_date)
+        if tab == 'shop':
+            rows = _ads_split_cached(start_date, end_date)
+            value = _comp_metric_value(_agg_comp(rows, 'shop'), metric)
+        else:
+            daily = _ads_daily_cached(start_date, end_date)
+            if not daily:
+                return err_resp('INVALID_API_RESPONSE')
+            value = _daily_metric_value(daily, metric)
     except Exception as e:
         return _map_exc_to_err(e, err_resp)
-    if not daily:
-        return err_resp('INVALID_API_RESPONSE')
-    if metric == 'sov':
-        return err_resp('METRIC_NOT_AVAILABLE')
-    value = _daily_metric_value(daily, metric)
     if value is None:
-        return err_resp('INVALID_API_RESPONSE')
+        # mis. 'sold' per komponen: item_sold tidak ada per-campaign → METRIC_NOT_AVAILABLE,
+        # bukan 0 (0 = angka palsu).
+        return err_resp('METRIC_NOT_AVAILABLE')
     resp = ok_resp(metric, value, kind)
     if tab == 'shop':
         resp['is_estimate'] = True
@@ -1227,32 +1252,69 @@ def _series_metric_value(item, metric):
         return round((sales / spend) if spend else 0.0, 2)
     return None
 
-def get_metric_series(metric, start_date, end_date, interval='day', tab='product'):
-    """Time-series metric (chart) — Iklan Produk (tab='product', get_all_cpc_ads_daily_performance)
-    atau Iklan Toko+ ESTIMASI (tab='shop', selisih total-produk, lihat _ads_shop_estimate_daily).
+def _series_comp_value(row, comp, metric):
+    c = row.get(comp) if isinstance(row, dict) and comp in row else row
+    imp = int(c.get('imp') or 0)
+    clk = int(c.get('clk') or 0)
+    ord_ = int(c.get('ord') or 0)
+    sold = c.get('sold')
+    gmv = float(c.get('gmv') or 0)
+    exp = float(c.get('exp') or 0)
+    if metric == 'impressions':
+        return imp
+    if metric == 'clicks':
+        return clk
+    if metric == 'orders':
+        return ord_
+    if metric == 'sold':
+        return sold
+    if metric == 'sales':
+        return int(round(gmv))
+    if metric == 'ad_spend':
+        return int(round(exp))
+    if metric == 'ctr':
+        return round((clk / imp * 100.0) if imp else 0.0, 2)
+    if metric == 'roas':
+        return round((gmv / exp) if exp else 0.0, 2)
+    return None
 
-    tab di luar 'product'/'shop' ditolak eksplisit (ENDPOINT_NOT_CONFIGURED) — sebelum
-    fix ini, endpoint diam-diam menghitung dari data 'product' tapi tetap label
-    tab:'product' di response, jadi consumer yang minta tab=shop bakal dapet angka
-    Iklan Produk yang dikira Iklan Toko. Sekarang tab=shop dihitung & dilabel jujur
-    sebagai estimasi (is_estimate=True), bukan lagi ditolak mentah-mentah."""
+def get_metric_series(metric, start_date, end_date, interval='day', tab='product'):
+    """Time-series metric (chart) — Iklan Produk (tab='product') atau Iklan Toko+
+    ESTIMASI (tab='shop', selisih total−produk lewat _ads_split_cached).
+
+    tab=shop dihitung & dilabel jujur sebagai estimasi (is_estimate=True), bukan
+    dilarang mentah-mentah. SOV/sold tidak tersedia per komponen → METRIC_NOT_AVAILABLE
+    (jangan dikarang jadi 0). Estimasi shop juga tidak bisa per jam.
+    """
     if tab not in ('product', 'shop'):
         return {'success': False, 'error': 'ENDPOINT_NOT_CONFIGURED', 'tab': tab}
     valid = metric in _METRIC_KIND
     if not valid:
         return {'success': False, 'error': 'INVALID_METRIC'}
-    if tab == 'shop' and metric in _SHOP_UNAVAILABLE_METRICS:
-        return {'success': False, 'error': 'METRIC_NOT_AVAILABLE', 'tab': tab}
-    if tab == 'shop' and interval == 'hour':
-        # get_product_campaign_daily_performance cuma harian → estimasi shop gak
-        # bisa dipecah per jam (gak ada apa pun buat dikurangkan dari total per jam).
-        return {'success': False, 'error': 'METRIC_NOT_AVAILABLE', 'tab': tab}
+    if tab == 'shop':
+        if metric in ('sov', 'sold'):
+            return {'success': False, 'error': 'METRIC_NOT_AVAILABLE', 'tab': tab}
+        if interval == 'hour':
+            # Agregat campaign cuma harian → tidak ada apa pun buat dikurangkan per jam.
+            return {'success': False, 'error': 'METRIC_NOT_AVAILABLE', 'tab': tab}
+        try:
+            rows = _ads_split_cached(start_date, end_date)
+        except Exception:
+            return {'success': False, 'error': 'INVALID_API_RESPONSE', 'tab': tab}
+        out = []
+        for r in rows or []:
+            dd = (r.get('date') or '')
+            try:
+                iso = datetime.datetime.strptime(dd, '%d-%m-%Y').strftime('%Y-%m-%d')
+            except Exception:
+                iso = dd
+            out.append({'date': iso, 'value': _comp_metric_value(r.get('shop') or {}, metric)})
+        return {'success': True, 'metric': metric, 'interval': interval, 'tab': 'shop',
+                'is_estimate': True, 'estimate_note': _ADS_ESTIMATE_NOTE, 'points': out}
     try:
         if interval == 'hour':
             items = _orders_get('ads_hourly_metric', f'adsh_{start_date}',
                                 lambda: _ads_hourly_for_date(start_date), ttl=ADS_METRIC_TTL)
-        elif tab == 'shop':
-            items = _ads_shop_estimate_cached(start_date, end_date)
         else:
             items = _ads_daily_cached(start_date, end_date)
     except Exception:
@@ -1270,11 +1332,7 @@ def get_metric_series(metric, start_date, end_date, interval='day', tab='product
             except Exception:
                 iso = dd
             out.append({'date': iso, 'value': v})
-    result = {'success': True, 'metric': metric, 'interval': interval, 'tab': tab, 'points': out}
-    if tab == 'shop':
-        result['is_estimate'] = True
-        result['estimate_note'] = _ADS_ESTIMATE_NOTE
-    return result
+    return {'success': True, 'metric': metric, 'interval': interval, 'tab': 'product', 'points': out}
 
 def _ads_hourly_for_date(date_iso):
     dmy = _iso_to_dmy(date_iso)
