@@ -156,7 +156,9 @@ def gql(endpoint, signer, query):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=25) as r:
+        # Timeout pendek (8 detik) — server yang diam-diam tidak membalas
+        # ("silently blocked") tidak boleh bikin skrip ini terlihat macet.
+        with urllib.request.urlopen(req, timeout=8) as r:
             return r.status, r.read().decode(errors="replace")
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode(errors="replace")
@@ -180,8 +182,9 @@ line()
 working = None
 for ep in ENDPOINTS:
     for name, signer in SCHEMES:
-        code, body = gql(ep, signer, "{ __typename }")
         tag = f"{ep.split('//')[1].split('/')[0]}  {name}"
+        line(f"  … mencoba {tag} (maks 8 detik)")
+        code, body = gql(ep, signer, "{ __typename }")
         if code == 0:
             line(f"  ✗ {tag}\n      gagal jaringan: {body[:80]}")
         elif not body.strip().startswith("{"):
@@ -204,6 +207,7 @@ if not working:
 
 # ── 5. Tanya API-nya sendiri data apa yang tersedia ──────────────────────────
 head("5. DATA YANG BISA DIAMBIL KREDENSIAL INI")
+line("  … menanyakan skema data ke server (maks 8 detik)")
 INTROSPECT = (
     "{ __schema { queryType { name fields { name description args { name } "
     "type { kind name ofType { kind name ofType { kind name } } } } } } }"
